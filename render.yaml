@@ -1,0 +1,46 @@
+services:
+  - type: web
+    name: signal-dashboard
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: APP_USERNAME
+        sync: false
+      - key: APP_PASSWORD
+        sync: false
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: REFRESH_TOKEN
+        sync: false
+      - key: GSC_SITE_URL
+        sync: false
+      - key: GSC_MOCK
+        value: "true"
+      - key: GSC_SERVICE_ACCOUNT_JSON
+        sync: false
+      - key: GA4_PROPERTY_ID
+        sync: false
+      - key: GA4_MOCK
+        value: "true"
+      - key: GA4_SERVICE_ACCOUNT_JSON
+        sync: false
+      - key: NAVER_API_KEY
+        sync: false
+      - key: NAVER_SECRET_KEY
+        sync: false
+      - key: NAVER_CUSTOMER_ID
+        sync: false
+      - key: NAVER_MOCK
+        value: "true"
+      - key: SERPAPI_KEY
+        sync: false
+      - key: MY_URL
+        sync: false
+      - key: COMPETITOR_URLS
+        sync: false
+      - key: TARGET_KEYWORDS
+        sync: false
+      - key: DB_PATH
+        value: "/opt/render/project/src/app.db"

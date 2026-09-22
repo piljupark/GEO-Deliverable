@@ -1,0 +1,7 @@
+*.db
+*.pyc
+__pycache__/
+.env
+*.json
+!package*.json
+.DS_Store
