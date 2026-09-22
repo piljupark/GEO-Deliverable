@@ -182,6 +182,13 @@ def analyze_content(request: Request, url: str = "", competitors: str = ""):
           <div class="score-num">측정 실패</div>
           <div class="score-detail">{html.escape(psi.get('detail') or '알 수 없는 오류')}</div>
         </div>"""
+    elif psi["source"] == "LIVE" and psi["performance"] is None:
+        score_cards += """
+        <div class="score-card">
+          <div class="score-label">웹 성능</div>
+          <div class="score-num">측정 불가</div>
+          <div class="score-detail">응답은 왔지만 성능 점수가 비어 있습니다.</div>
+        </div>"""
     elif psi["source"] == "LIVE":
         lcp = psi["lcp"] if psi["lcp"] is not None else "—"
         cls = psi["cls"] if psi["cls"] is not None else "—"

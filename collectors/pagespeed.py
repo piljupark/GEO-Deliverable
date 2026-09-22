@@ -7,8 +7,9 @@ Google PageSpeed Insights API 연동.
 "PageSpeed Insights API" 사용 설정 → API 키 만들기 (기존 프로젝트 재사용 가능)
 """
 
-import requests
 from datetime import datetime, timezone
+
+from collectors._http import request_with_retry
 
 ENDPOINT = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
 
@@ -28,9 +29,9 @@ def collect_pagespeed(url, api_key=None, strategy="mobile"):
         params["key"] = api_key
 
     try:
-        # 실제 서버에서 풀 Lighthouse 감사를 돌리는 API라 30초를 넘기는 경우가 흔하다.
-        resp = requests.get(ENDPOINT, params=params, timeout=60)
-        resp.raise_for_status()
+        # 실제 서버에서 풀 Lighthouse 감사를 돌리는 API라 느릴 때가 많고, 타임아웃/5xx가
+        # 종종 일시적으로 난다 — 짧게 재시도한다.
+        resp = request_with_retry("GET", ENDPOINT, params=params, timeout=60)
         data = resp.json()
     except Exception as e:
         return {

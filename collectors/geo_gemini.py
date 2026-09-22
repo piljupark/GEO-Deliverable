@@ -8,9 +8,10 @@ mock 없음 — 실패하면 가짜 값 대신 명확한 ERROR 상태를 반환�
 """
 
 import re
-import requests
 from datetime import datetime, timezone
 from urllib.parse import urlparse
+
+from collectors._http import request_with_retry
 
 ENDPOINT_TMPL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
@@ -43,8 +44,8 @@ def query_gemini(prompt_text, api_key, model="gemini-flash-latest"):
     }
     # 쿼리파라미터(?key=)가 아니라 헤더로 인증해야 한다 — 안 그러면 401/404가 난다.
     headers = {"Content-Type": "application/json", "X-goog-api-key": api_key}
-    resp = requests.post(url, headers=headers, json=body, timeout=30)
-    resp.raise_for_status()
+    # 503(서버 일시 장애)이 종종 나서 짧게 재시도한다.
+    resp = request_with_retry("POST", url, headers=headers, json=body, timeout=30)
     data = resp.json()
 
     candidates = data.get("candidates") or []
@@ -131,8 +132,7 @@ def generate_prompts(tech, api_key, model="gemini-flash-latest", count=5):
     url = ENDPOINT_TMPL.format(model=model)
     body = {"contents": [{"parts": [{"text": ask}]}]}
     headers = {"Content-Type": "application/json", "X-goog-api-key": api_key}
-    resp = requests.post(url, headers=headers, json=body, timeout=30)
-    resp.raise_for_status()
+    resp = request_with_retry("POST", url, headers=headers, json=body, timeout=30)
     data = resp.json()
 
     candidates = data.get("candidates") or []
