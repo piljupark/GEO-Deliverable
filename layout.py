@@ -16,6 +16,9 @@ NAV_ITEMS = [
         ("URL 분석", "/", "analyze"),
     ]),
     ("설정", [
+        ("내 사이트", "/settings/site", "settings-site"),
+        ("경쟁사", "/settings/competitors", "settings-competitors"),
+        ("프롬프트 목록", "/settings/prompts", "settings-prompts"),
         ("로그아웃", "/logout", "logout"),
     ]),
 ]

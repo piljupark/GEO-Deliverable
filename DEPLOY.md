@@ -77,6 +77,48 @@ GEMINI_API_KEY = ...      # AI 노출 체크 (없으면 이 섹션만 비활성�
 
 ---
 
+## 3-1. Supabase 테이블 (선택 — 추이 그래프 · 내 사이트/경쟁사/프롬프트 저장)
+
+`SUPABASE_URL`/`SUPABASE_KEY`를 설정했다면, Supabase 대시보드 → SQL Editor에서 아래를
+한 번 실행해 테이블을 만들어주세요. 없어도 앱은 동작하지만 추이 그래프와 설정 3개
+(내 사이트/경쟁사/프롬프트 목록) 페이지가 "설정되지 않음" 상태로 남습니다.
+
+```sql
+create table if not exists geo_history (
+  domain text not null,
+  date date not null,
+  exposure_score int,
+  citation_share int,
+  mention_share int,
+  primary key (domain, date)
+);
+
+create table if not exists geo_site_config (
+  id smallint primary key default 1,
+  site_urls jsonb not null default '[]',
+  brand_aliases jsonb not null default '[]',
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists geo_competitors (
+  id bigserial primary key,
+  name text not null,
+  domain text not null,
+  aliases jsonb not null default '[]',
+  created_at timestamptz not null default now()
+);
+
+create table if not exists geo_prompts (
+  id bigserial primary key,
+  topic text,
+  prompt text not null,
+  archived boolean not null default false,
+  created_at timestamptz not null default now()
+);
+```
+
+---
+
 ## 4. 접속
 
 `https://앱이름-xxxx.onrender.com` 접속 → 로그인(APP_USERNAME/APP_PASSWORD) →
@@ -95,3 +137,4 @@ URL 입력창에 분석하고 싶은 사이트 주소를 넣고 분석.
 | "웹 성능: 측정 실패" | PageSpeed API 쿼터 초과(429) 가능성 큼 — `PAGESPEED_API_KEY`를 넣으면 대부분 해결 |
 | "AI 노출: GEMINI_API_KEY가 설정되지 않아..." | 아직 키를 안 넣은 것. 위 3번 참고 |
 | "AI 노출: 확인 실패: ..." | Gemini API 무료 쿼터 초과 또는 일시 오류. 잠시 후 재시도 |
+| "내 사이트/경쟁사/프롬프트 목록: SUPABASE_URL/SUPABASE_KEY가 설정되지 않아..." | 3-1번 SQL을 아직 안 돌렸거나 환경변수가 없는 것. 설정해도 테이블을 안 만들었으면 저장이 조용히 실패하니 SQL부터 실행 |

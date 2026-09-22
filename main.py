@@ -12,11 +12,13 @@ URL 즉석분석 웹앱.
   GET  /logout
   GET  /                URL 즉석분석 셸 (로그인 필요)
   GET  /_content/analyze  실제 분석 처리 (iframe 안에서 로드됨)
+  GET  /settings/site, /settings/competitors, /settings/prompts  저장 설정 (로그인 필요)
   GET  /health
 """
 
 import base64
 import html
+import re
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
@@ -27,6 +29,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, PlainTextResponse,
 from starlette.middleware.sessions import SessionMiddleware
 
 import config
+from collectors import settings_store
 from collectors.tech_audit import audit_technical
 from collectors.prescribe import prescribe
 from collectors.pagespeed import collect_pagespeed
@@ -120,9 +123,12 @@ def analyze_content(request: Request, url: str = "", competitors: str = ""):
     if not _require_login(request):
         return RedirectResponse("/login", status_code=303)
 
-    # url이 비어있으면 입력 폼만 보여준다
+    # url이 비어있으면 입력 폼만 보여준다 — 저장된 경쟁사가 있으면 입력칸에 미리 채워준다.
     if not url.strip():
-        return HTMLResponse(ANALYZE_FORM_PAGE)
+        saved_competitors = settings_store.list_competitors(config.SUPABASE_URL, config.SUPABASE_KEY)
+        prefill = ", ".join(c["domain"] for c in saved_competitors if c.get("domain"))
+        return HTMLResponse(ANALYZE_FORM_TEMPLATE.replace("{error}", "")
+                             .replace("{prev_url}", "").replace("{prev_competitors}", html.escape(prefill)))
 
     from collectors.onpage import USER_AGENT, TIMEOUT
 
@@ -146,9 +152,17 @@ def analyze_content(request: Request, url: str = "", competitors: str = ""):
     artifacts = generate_all(tech, brand_name=brand_name or None, social_urls=None)
     competitor_urls = [c.strip() for c in competitors.split(",") if c.strip()][:2]
 
+    # 설정에 저장된 브랜드 별칭·사이트 URL·경쟁사·프롬프트를 항상 분석에 반영한다
+    # (이 배포는 조직 1개 전용이라 워크스페이스 구분 없이 전부 적용).
+    site_cfg = settings_store.get_site_config(config.SUPABASE_URL, config.SUPABASE_KEY)
+    brand_names = [brand_name] + [a for a in site_cfg["brand_aliases"] if a != brand_name]
+    brand_domains = [target] + [u for u in site_cfg["site_urls"] if u != target]
+    saved_competitors = settings_store.list_competitors(config.SUPABASE_URL, config.SUPABASE_KEY)
+    saved_prompts = settings_store.list_prompts(config.SUPABASE_URL, config.SUPABASE_KEY, include_archived=False)
+
     return StreamingResponse(
-        _stream_analyze(target, r.text, tech, scores, rx, brand_name, artifacts,
-                         competitor_urls, USER_AGENT, TIMEOUT),
+        _stream_analyze(target, r.text, tech, scores, rx, brand_names, brand_domains, artifacts,
+                         competitor_urls, USER_AGENT, TIMEOUT, saved_competitors, saved_prompts),
         media_type="text/html",
     )
 
@@ -339,18 +353,57 @@ def _render_trend_svg(points, color="#2a78d6"):
     <div class="trend-val">최근값 {last_val}%</div>"""
 
 
-def _render_geo_and_citation(gen_prompts, gen_prompts_error, tech, brand_name, target, competitor_data):
+def _render_trend_section(history):
+    """history: get_history() 결과. 값이 2개 미만이면 그릴 게 없어 빈 문자열."""
+    if not history:
+        return ""
+    exp_pts = [(h["date"], h["exposure_score"]) for h in history]
+    cit_pts = [(h["date"], h["citation_share"]) for h in history]
+    men_pts = [(h["date"], h["mention_share"]) for h in history]
+    exp_svg = _render_trend_svg(exp_pts, "#2a78d6")
+    cit_svg = _render_trend_svg(cit_pts, "#1baf7a")
+    men_svg = _render_trend_svg(men_pts, "#eb6834")
+    if not (exp_svg or cit_svg or men_svg):
+        return ""
+    return f"""
+    <div class="card">
+      <h2>추이 (최근 {len(history)}일)</h2>
+      <div class="trend-grid">
+        <div class="trend-item"><h3>노출도 점수</h3>{exp_svg or '<div class="issue-empty">데이터 부족</div>'}</div>
+        <div class="trend-item"><h3>인용 점유율</h3>{cit_svg or '<div class="issue-empty">데이터 부족</div>'}</div>
+        <div class="trend-item"><h3>언급 점유율</h3>{men_svg or '<div class="issue-empty">데이터 부족</div>'}</div>
+      </div>
+    </div>"""
+
+
+def _render_geo_and_citation(gen_prompts, gen_prompts_error, tech, brand_names, brand_domains, target,
+                              competitor_data, extra_competitors, prompts_source="generated"):
     """AI 노출(Gemini) + 인용 상세 카드를 만든다. 실패하면 가짜 점수 대신 명확한 에러만 표시.
+    brand_names/brand_domains: 등록된 브랜드 별칭·사이트 URL을 전부 포함한 리스트 (guess한 이름/분석 대상
+    URL이 항상 0번째). extra_competitors: 설정에 저장된 경쟁사 목록 — 이번에 직접 크롤링하지 않아도
+    Gemini 노출·인용 판별에는 포함시킨다.
     반환값: (geo_section_html, citation_detail_html)"""
+    brand_label = brand_names[0]
     try:
         if gen_prompts_error:
             raise gen_prompts_error
         competitors_for_gemini = [
             {"name": c["brand"], "domain": c["url"]} for c in competitor_data if not c["error"]
         ]
+        existing_domains = {_cite_domain(c["domain"]) for c in competitors_for_gemini}
+        for sc in extra_competitors:
+            dom = sc.get("domain") or ""
+            key = _cite_domain(dom) if dom else None
+            if key and key in existing_domains:
+                continue
+            competitors_for_gemini.append({
+                "name": sc.get("name") or dom, "domain": dom, "aliases": sc.get("aliases") or [],
+            })
+            if key:
+                existing_domains.add(key)
         geo = run_geo_visibility(
             gen_prompts, config.GEMINI_API_KEY, config.GEMINI_MODEL,
-            brand_name=brand_name, brand_domain=target,
+            brand_name=brand_names, brand_domain=brand_domains,
             competitors=competitors_for_gemini,
         )
         live = [rec for rec in geo["records"] if rec["status"] == "LIVE"]
@@ -371,7 +424,7 @@ def _render_geo_and_citation(gen_prompts, gen_prompts_error, tech, brand_name, t
             </div>"""
 
         # 경쟁사별 노출도/인용 — 자사와 같은 질문 세트를 같은 응답에서 함께 판별한 것.
-        tracked = [(brand_name, mentioned_count, cited_count)]
+        tracked = [(brand_label, mentioned_count, cited_count)]
         for comp in competitors_for_gemini:
             name = comp["name"]
             cm = sum(1 for rec in live if rec["competitor_mentions"].get(name))
@@ -381,7 +434,7 @@ def _render_geo_and_citation(gen_prompts, gen_prompts_error, tech, brand_name, t
         # 노출도 순위 — 등록한 사이트들(자사+경쟁사) 안에서의 순위. "시장 전체 1위"가 아니라
         # "내가 등록한 비교 대상 중 순위"라는 걸 라벨에서 분명히 한다.
         ranked = sorted(tracked, key=lambda t: -t[1])
-        self_rank = next((i for i, t in enumerate(ranked, 1) if t[0] == brand_name), None) if total else None
+        self_rank = next((i for i, t in enumerate(ranked, 1) if t[0] == brand_label), None) if total else None
 
         # 언급 점유율 — 개별 노출도(%)가 아니라 "전체 언급 중 내 비중" (share of voice).
         total_mentions_all = sum(t[1] for t in tracked)
@@ -436,7 +489,7 @@ def _render_geo_and_citation(gen_prompts, gen_prompts_error, tech, brand_name, t
             max_cnt = max(t[1] for t in tracked) or 1
             for name, cnt, _ in ranked:
                 pct_of_max = round(cnt / max_cnt * 100)
-                is_self = name == brand_name
+                is_self = name == brand_label
                 bar_color = "#2a78d6" if is_self else "#C3C2B7"
                 exposure_bar_html += f"""
                 <div class="bar-row">
@@ -461,7 +514,7 @@ def _render_geo_and_citation(gen_prompts, gen_prompts_error, tech, brand_name, t
                     continue
                 color = palette[i % len(palette)]
                 pct = round(cnt / total_mentions_all * 100)
-                is_self = name == brand_name
+                is_self = name == brand_label
                 segs += f'<div style="flex:{cnt} 0 0;background:{color}"></div>'
                 legend += f'<div class="legend-item"><span class="legend-swatch" style="background:{color}"></span>{html.escape(name)}{" (자사)" if is_self else ""} {pct}%</div>'
             mention_share_html = f"""
@@ -473,14 +526,15 @@ def _render_geo_and_citation(gen_prompts, gen_prompts_error, tech, brand_name, t
             </div>"""
 
         # 인용 상세 — 실제로 인용된 URL을 도메인 기준 자사/경쟁사/제3자로 분류, 페이지별 순위화.
-        target_domain = _cite_domain(target)
+        # 자사 판정은 지금 분석 중인 URL 하나가 아니라 등록된 모든 사이트 URL 기준.
+        own_domains = {_cite_domain(d) for d in brand_domains}
         competitor_domains = {_cite_domain(c["domain"]) for c in competitors_for_gemini}
         all_cited = [u for rec in live for u in rec["cited_urls"]]
         page_counts = Counter(all_cited)
 
         def _classify_source(u):
             d = _cite_domain(u)
-            if d == target_domain:
+            if d in own_domains:
                 return "자사"
             if d in competitor_domains:
                 return "경쟁사"
@@ -538,44 +592,11 @@ def _render_geo_and_citation(gen_prompts, gen_prompts_error, tech, brand_name, t
             <div class="card" id="ph-geo">
               <h2>AI 노출 (Gemini)</h2>
               {quota_banner}
-            </div>"""
-            if history:
-                exp_pts = [(h["date"], h["exposure_score"]) for h in history]
-                cit_pts = [(h["date"], h["citation_share"]) for h in history]
-                men_pts = [(h["date"], h["mention_share"]) for h in history]
-                exp_svg = _render_trend_svg(exp_pts, "#2a78d6")
-                cit_svg = _render_trend_svg(cit_pts, "#1baf7a")
-                men_svg = _render_trend_svg(men_pts, "#eb6834")
-                if exp_svg or cit_svg or men_svg:
-                    geo_section += f"""
-                    <div class="card">
-                      <h2>추이 (최근 {len(history)}일)</h2>
-                      <div class="trend-grid">
-                        <div class="trend-item"><h3>노출도 점수</h3>{exp_svg or '<div class="issue-empty">데이터 부족</div>'}</div>
-                        <div class="trend-item"><h3>인용 점유율</h3>{cit_svg or '<div class="issue-empty">데이터 부족</div>'}</div>
-                        <div class="trend-item"><h3>언급 점유율</h3>{men_svg or '<div class="issue-empty">데이터 부족</div>'}</div>
-                      </div>
-                    </div>"""
+            </div>""" + _render_trend_section(history)
             return geo_section, citation_detail_section
-        trend_section = ""
-        if history:
-            exp_pts = [(h["date"], h["exposure_score"]) for h in history]
-            cit_pts = [(h["date"], h["citation_share"]) for h in history]
-            men_pts = [(h["date"], h["mention_share"]) for h in history]
-            exp_svg = _render_trend_svg(exp_pts, "#2a78d6")
-            cit_svg = _render_trend_svg(cit_pts, "#1baf7a")
-            men_svg = _render_trend_svg(men_pts, "#eb6834")
-            if exp_svg or cit_svg or men_svg:
-                trend_section = f"""
-                <div class="card">
-                  <h2>추이 (최근 {len(history)}일)</h2>
-                  <div class="trend-grid">
-                    <div class="trend-item"><h3>노출도 점수</h3>{exp_svg or '<div class="issue-empty">데이터 부족</div>'}</div>
-                    <div class="trend-item"><h3>인용 점유율</h3>{cit_svg or '<div class="issue-empty">데이터 부족</div>'}</div>
-                    <div class="trend-item"><h3>언급 점유율</h3>{men_svg or '<div class="issue-empty">데이터 부족</div>'}</div>
-                  </div>
-                </div>"""
+        trend_section = _render_trend_section(history)
 
+        prompts_desc = "저장된 프롬프트" if prompts_source == "saved" else "자동 생성된 질문"
         geo_rows = ""
         for rec in geo["records"]:
             if rec["status"] != "LIVE":
@@ -603,7 +624,7 @@ def _render_geo_and_citation(gen_prompts, gen_prompts_error, tech, brand_name, t
         geo_section = f"""
         <div class="card" id="ph-geo">
           <h2>AI 노출 (Gemini)</h2>
-          <div class="sub-inline">자동 생성된 질문 {len(geo['records'])}개 중 {total}개 성공 · Google Search grounding 기반 실데이터</div>
+          <div class="sub-inline">{prompts_desc} {len(geo['records'])}개 중 {total}개 성공 · Google Search grounding 기반 실데이터</div>
           <div class="scores" style="margin:14px 0 18px">
             {overview_cards}
           </div>
@@ -630,17 +651,24 @@ def _b64(s):
     return base64.b64encode(s.encode("utf-8")).decode("ascii")
 
 
-def _stream_analyze(target, page_html, tech, scores, rx, brand_name, artifacts,
-                     competitor_urls, user_agent, timeout):
+def _stream_analyze(target, page_html, tech, scores, rx, brand_names, brand_domains, artifacts,
+                     competitor_urls, user_agent, timeout, saved_competitors, saved_prompts):
     """
     독립적인 외부 호출(PSI·현재 GEO 상태·경쟁사 크롤링·Gemini)이 끝나는 대로 해당 카드를
     채워 넣고 진행률을 갱신하는 스트리밍 응답. 브라우저가 청크를 받는 대로 그 안의
     <script>를 실행하기 때문에, 클라이언트 쪽엔 폴링/웹소켓 없이 그냥 평범한 HTML 응답이다.
     (호스팅의 리버스 프록시가 응답을 전부 버퍼링하면 실시간 효과는 없어지지만, 최종
     결과는 동일하게 나온다.)
+
+    saved_prompts가 있으면 Gemini에 새로 질문을 생성시키지 않고 그대로 쓴다 — 매번 다른
+    질문이면 추이 비교가 의미 없어지기 때문. saved_competitors는 이번에 직접 크롤링하지
+    않아도 Gemini 노출·인용 판별 비교 대상에 포함시킨다.
     """
     gemini_enabled = bool(config.GEMINI_API_KEY)
-    steps_total = 2 + len(competitor_urls) + (2 if gemini_enabled else 0)
+    using_saved_prompts = gemini_enabled and bool(saved_prompts)
+    steps_total = 2 + len(competitor_urls)
+    if gemini_enabled:
+        steps_total += 1 if using_saved_prompts else 2
 
     seo_cards = _render_seo_score_cards(scores)
     issue_rows = _render_issue_rows(rx)
@@ -709,11 +737,14 @@ def _stream_analyze(target, page_html, tech, scores, rx, brand_name, artifacts,
         futures[ex.submit(collect_pagespeed, target, api_key=config.PAGESPEED_API_KEY or None)] = ("psi", None)
         for i, curl in enumerate(competitor_urls):
             futures[ex.submit(_crawl_competitor, curl, user_agent, timeout)] = ("competitor", i)
-        if gemini_enabled:
+        if gemini_enabled and not using_saved_prompts:
             futures[ex.submit(generate_prompts, tech, config.GEMINI_API_KEY, config.GEMINI_MODEL, count=3)] = ("prompts", None)
 
         competitor_data = [None] * len(competitor_urls)
-        gen_state = {"ready": not gemini_enabled, "value": None, "error": None}
+        if using_saved_prompts:
+            gen_state = {"ready": True, "value": [p["prompt"] for p in saved_prompts], "error": None}
+        else:
+            gen_state = {"ready": not gemini_enabled, "value": None, "error": None}
         gemini_emitted = False
 
         def competitors_ready():
@@ -722,8 +753,9 @@ def _stream_analyze(target, page_html, tech, scores, rx, brand_name, artifacts,
         def build_gemini_chunk():
             nonlocal done
             geo_html, cite_html = _render_geo_and_citation(
-                gen_state["value"], gen_state["error"], tech, brand_name, target,
-                [c for c in competitor_data if c is not None],
+                gen_state["value"], gen_state["error"], tech, brand_names, brand_domains, target,
+                [c for c in competitor_data if c is not None], saved_competitors,
+                prompts_source="saved" if using_saved_prompts else "generated",
             )
             done += 1
             script = f"fillEl('ph-geo','{_b64(geo_html)}');"
@@ -837,7 +869,6 @@ label.sub-label{display:block;font-size:11.5px;color:#9A9DA3;margin:2px 0 6px}
 </script>
 </body></html>
 """
-ANALYZE_FORM_PAGE = ANALYZE_FORM_TEMPLATE.replace("{error}", "").replace("{prev_url}", "").replace("{prev_competitors}", "")
 
 
 ANALYZE_CSS = """
@@ -943,6 +974,313 @@ function cp(id){
 }
 </script>
 """
+
+
+# ---------------- 설정: 내 사이트 / 경쟁사 / 프롬프트 목록 ----------------
+# 매번 URL 분석할 때마다 경쟁사를 타이핑하고 Gemini 질문을 새로 생성하면, 오늘과
+# 내일의 측정 기준이 달라져 추이 비교가 무의미해진다. 여기서 저장해두면
+# analyze_content()가 항상 이 값을 가져다 쓴다.
+
+def _split_lines(s):
+    """줄바꿈·쉼표 어느 쪽으로 구분해도 되는 textarea/input 값을 리스트로. 중복 제거."""
+    parts = re.split(r"[\n,]+", s or "")
+    seen = []
+    for p in parts:
+        p = p.strip()
+        if p and p not in seen:
+            seen.append(p)
+    return seen
+
+
+def _settings_unconfigured_page(feature_name):
+    return f"""<!DOCTYPE html><html lang="ko"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>{SETTINGS_CSS}</style></head><body>
+<div class="app">
+  <div class="card">
+    <h2>{html.escape(feature_name)}</h2>
+    <div class="issue-empty">SUPABASE_URL/SUPABASE_KEY가 설정되지 않아 이 기능을 쓸 수 없습니다. Render 환경변수에 추가해주세요.</div>
+  </div>
+</div>
+</body></html>"""
+
+
+def _render_site_settings_page(cfg, saved=False):
+    banner = '<div class="banner-ok">저장했습니다.</div>' if saved else ""
+    site_urls_val = "\n".join(cfg["site_urls"])
+    brand_aliases_val = "\n".join(cfg["brand_aliases"])
+    return f"""<!DOCTYPE html><html lang="ko"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>{SETTINGS_CSS}</style></head><body>
+<div class="app">
+  {banner}
+  <div class="card">
+    <h2>내 사이트</h2>
+    <div class="desc">등록한 URL은 자사 인용으로, 등록한 이름은 자사 노출로 판별합니다. URL 분석 시 항상 반영됩니다.</div>
+    <form method="post" action="/_content/settings/site">
+      <div class="field">
+        <label>내 사이트 URL (줄바꿈 또는 쉼표로 구분)</label>
+        <textarea name="site_urls" placeholder="https://example.com">{html.escape(site_urls_val)}</textarea>
+      </div>
+      <div class="field">
+        <label>자사 노출 인식 이름 (줄바꿈 또는 쉼표로 구분)</label>
+        <textarea name="brand_aliases" placeholder="브랜드명, 회사명, 영문 표기 등">{html.escape(brand_aliases_val)}</textarea>
+        <div class="hint">AI 답변 본문에 위 이름 중 하나가 표시되면 자사 노출로 집계합니다.</div>
+      </div>
+      <button type="submit" class="primary">저장</button>
+    </form>
+  </div>
+</div>
+</body></html>"""
+
+
+def _render_competitors_settings_page(competitors, added=False, deleted=False):
+    banner = ""
+    if added:
+        banner = '<div class="banner-ok">경쟁사를 추가했습니다.</div>'
+    elif deleted:
+        banner = '<div class="banner-ok">경쟁사를 삭제했습니다.</div>'
+    rows = ""
+    for c in competitors:
+        aliases = ", ".join(c.get("aliases") or [])
+        sub = html.escape(c.get("domain") or "")
+        if aliases:
+            sub += " · " + html.escape(aliases)
+        rows += f"""
+        <div class="list-row">
+          <div class="list-main">
+            <div class="list-title">{html.escape(c.get('name') or c.get('domain') or '')}</div>
+            <div class="list-sub">{sub}</div>
+          </div>
+          <div class="list-actions">
+            <form method="post" action="/_content/settings/competitors/{c['id']}/delete" onsubmit="return confirm('삭제하시겠습니까?')">
+              <button type="submit" class="danger">삭제</button>
+            </form>
+          </div>
+        </div>"""
+    if not rows:
+        rows = '<div class="issue-empty">등록된 경쟁사가 없습니다.</div>'
+    return f"""<!DOCTYPE html><html lang="ko"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>{SETTINGS_CSS}</style></head><body>
+<div class="app">
+  {banner}
+  <div class="card">
+    <h2>경쟁사 관리</h2>
+    <div class="desc">추적할 경쟁사를 관리합니다. URL 분석 시 AI 노출·인용 비교에 자동으로 포함됩니다.</div>
+    {rows}
+  </div>
+  <div class="card">
+    <h2>경쟁사 추가</h2>
+    <form method="post" action="/_content/settings/competitors/add" class="add-row">
+      <div class="field"><label>이름</label><input name="name" placeholder="경쟁사명" required></div>
+      <div class="field"><label>도메인</label><input name="domain" placeholder="competitor.com" required></div>
+      <div class="field"><label>별칭 (쉼표로 구분, 선택)</label><input name="aliases" placeholder="약칭, 영문명"></div>
+      <button type="submit" class="primary">추가</button>
+    </form>
+  </div>
+</div>
+</body></html>"""
+
+
+def _render_prompts_settings_page(prompts, added=False, deleted=False):
+    banner = ""
+    if added:
+        banner = '<div class="banner-ok">프롬프트를 추가했습니다.</div>'
+    elif deleted:
+        banner = '<div class="banner-ok">프롬프트를 삭제했습니다.</div>'
+    rows = ""
+    for p in prompts:
+        status = '<span class="tag tag-no">보관됨</span>' if p.get("archived") else '<span class="tag tag-yes">모니터링 중</span>'
+        toggle_label = "복원" if p.get("archived") else "보관"
+        topic = p.get("topic") or ""
+        sub = (html.escape(topic) + " · " if topic else "") + status
+        rows += f"""
+        <div class="list-row">
+          <div class="list-main">
+            <div class="list-title">{html.escape(p.get('prompt') or '')}</div>
+            <div class="list-sub">{sub}</div>
+          </div>
+          <div class="list-actions">
+            <form method="post" action="/_content/settings/prompts/{p['id']}/toggle">
+              <button type="submit" class="ghost">{toggle_label}</button>
+            </form>
+            <form method="post" action="/_content/settings/prompts/{p['id']}/delete" onsubmit="return confirm('삭제하시겠습니까?')">
+              <button type="submit" class="danger">삭제</button>
+            </form>
+          </div>
+        </div>"""
+    if not rows:
+        rows = '<div class="issue-empty">등록된 프롬프트가 없습니다. 없으면 분석할 때마다 자동 생성됩니다.</div>'
+    return f"""<!DOCTYPE html><html lang="ko"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>{SETTINGS_CSS}</style></head><body>
+<div class="app">
+  {banner}
+  <div class="card">
+    <h2>프롬프트 목록</h2>
+    <div class="desc">저장해두면 분석할 때마다 새로 생성하지 않고 이 질문들로 AI 노출을 추적해서 날짜별 비교가 가능해집니다. 비워두면 지금처럼 자동 생성됩니다.</div>
+    {rows}
+  </div>
+  <div class="card">
+    <h2>프롬프트 추가</h2>
+    <form method="post" action="/_content/settings/prompts/add" class="add-row">
+      <div class="field"><label>주제 (선택)</label><input name="topic" placeholder="예: 가격·도입 조건"></div>
+      <div class="field" style="flex:2"><label>프롬프트</label><input name="prompt" placeholder="AI에게 던질 질문" required></div>
+      <button type="submit" class="primary">추가</button>
+    </form>
+  </div>
+</div>
+</body></html>"""
+
+
+SETTINGS_CSS = """
+@import url('https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.css');
+:root{--bg:#FAFAF9;--line:#E4E4E1;--ink:#14161A;--dim:#5B5F66;--dim2:#9A9DA3;--accent:#1E5E46}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:'Pretendard',sans-serif;
+  font-size:14px;line-height:1.6}
+.app{max-width:760px;margin:0 auto;padding:32px 24px 64px}
+.card{border:1px solid var(--line);border-radius:2px;padding:24px;margin-bottom:16px}
+.card h2{font-size:15px;font-weight:500;margin:0 0 6px}
+.card .desc{font-size:12.5px;color:var(--dim2);margin-bottom:16px}
+.field{margin-bottom:14px}
+.field label{display:block;font-size:12.5px;color:var(--dim);margin-bottom:6px}
+.field textarea,.field input{width:100%;padding:9px 10px;border:1px solid var(--line);
+  border-radius:2px;font-size:13.5px;font-family:inherit;box-sizing:border-box;resize:vertical}
+.field textarea{min-height:76px}
+.field .hint{font-size:11.5px;color:var(--dim2);margin-top:4px}
+button.primary{padding:9px 16px;background:var(--ink);color:#fff;border:none;
+  border-radius:2px;font-size:13px;cursor:pointer}
+button.danger{padding:5px 10px;background:transparent;color:#c5221f;border:1px solid #f0c9c7;
+  border-radius:2px;font-size:12px;cursor:pointer}
+button.ghost{padding:5px 10px;background:transparent;color:var(--dim);border:1px solid var(--line);
+  border-radius:2px;font-size:12px;cursor:pointer}
+.banner-ok{background:#E6F4EC;color:#1E5E46;font-size:12.5px;padding:9px 12px;
+  border-radius:2px;margin-bottom:16px}
+.list-row{display:flex;align-items:center;gap:12px;padding:12px 0;border-top:1px solid #ECECE9}
+.list-row:first-child{border-top:none}
+.list-main{flex:1;min-width:0}
+.list-title{font-size:13.5px;font-weight:500}
+.list-sub{font-size:12px;color:var(--dim2);margin-top:2px}
+.list-actions{display:flex;gap:6px;flex:0 0 auto}
+.tag{font-size:11px;padding:3px 8px;border-radius:10px;white-space:nowrap}
+.tag-yes{background:#E6F4EC;color:#1E5E46}
+.tag-no{background:#F0F0EE;color:var(--dim)}
+.issue-empty{color:var(--dim2);font-size:13px}
+.add-row{display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap}
+.add-row .field{flex:1;min-width:140px;margin-bottom:0}
+"""
+
+
+@app.get("/settings/site", response_class=HTMLResponse)
+def settings_site_shell(request: Request):
+    if not _require_login(request):
+        return RedirectResponse("/login", status_code=303)
+    return HTMLResponse(sidebar_shell("settings-site", "/_content/settings/site", title="내 사이트"))
+
+
+@app.get("/_content/settings/site", response_class=HTMLResponse)
+def settings_site_content(request: Request, saved: str = ""):
+    if not _require_login(request):
+        return RedirectResponse("/login", status_code=303)
+    if not settings_store.configured(config.SUPABASE_URL, config.SUPABASE_KEY):
+        return HTMLResponse(_settings_unconfigured_page("내 사이트"))
+    cfg = settings_store.get_site_config(config.SUPABASE_URL, config.SUPABASE_KEY)
+    return HTMLResponse(_render_site_settings_page(cfg, saved=bool(saved)))
+
+
+@app.post("/_content/settings/site")
+def settings_site_save(request: Request, site_urls: str = Form(""), brand_aliases: str = Form("")):
+    if not _require_login(request):
+        return RedirectResponse("/login", status_code=303)
+    settings_store.save_site_config(
+        config.SUPABASE_URL, config.SUPABASE_KEY,
+        _split_lines(site_urls), _split_lines(brand_aliases),
+    )
+    return RedirectResponse("/_content/settings/site?saved=1", status_code=303)
+
+
+@app.get("/settings/competitors", response_class=HTMLResponse)
+def settings_competitors_shell(request: Request):
+    if not _require_login(request):
+        return RedirectResponse("/login", status_code=303)
+    return HTMLResponse(sidebar_shell("settings-competitors", "/_content/settings/competitors", title="경쟁사"))
+
+
+@app.get("/_content/settings/competitors", response_class=HTMLResponse)
+def settings_competitors_content(request: Request, added: str = "", deleted: str = ""):
+    if not _require_login(request):
+        return RedirectResponse("/login", status_code=303)
+    if not settings_store.configured(config.SUPABASE_URL, config.SUPABASE_KEY):
+        return HTMLResponse(_settings_unconfigured_page("경쟁사 관리"))
+    competitors = settings_store.list_competitors(config.SUPABASE_URL, config.SUPABASE_KEY)
+    return HTMLResponse(_render_competitors_settings_page(competitors, added=bool(added), deleted=bool(deleted)))
+
+
+@app.post("/_content/settings/competitors/add")
+def settings_competitors_add(request: Request, name: str = Form(...), domain: str = Form(...), aliases: str = Form("")):
+    if not _require_login(request):
+        return RedirectResponse("/login", status_code=303)
+    settings_store.add_competitor(
+        config.SUPABASE_URL, config.SUPABASE_KEY,
+        name.strip(), domain.strip(), _split_lines(aliases),
+    )
+    return RedirectResponse("/_content/settings/competitors?added=1", status_code=303)
+
+
+@app.post("/_content/settings/competitors/{competitor_id}/delete")
+def settings_competitors_delete(request: Request, competitor_id: str):
+    if not _require_login(request):
+        return RedirectResponse("/login", status_code=303)
+    settings_store.delete_competitor(config.SUPABASE_URL, config.SUPABASE_KEY, competitor_id)
+    return RedirectResponse("/_content/settings/competitors?deleted=1", status_code=303)
+
+
+@app.get("/settings/prompts", response_class=HTMLResponse)
+def settings_prompts_shell(request: Request):
+    if not _require_login(request):
+        return RedirectResponse("/login", status_code=303)
+    return HTMLResponse(sidebar_shell("settings-prompts", "/_content/settings/prompts", title="프롬프트 목록"))
+
+
+@app.get("/_content/settings/prompts", response_class=HTMLResponse)
+def settings_prompts_content(request: Request, added: str = "", deleted: str = ""):
+    if not _require_login(request):
+        return RedirectResponse("/login", status_code=303)
+    if not settings_store.configured(config.SUPABASE_URL, config.SUPABASE_KEY):
+        return HTMLResponse(_settings_unconfigured_page("프롬프트 목록"))
+    prompts = settings_store.list_prompts(config.SUPABASE_URL, config.SUPABASE_KEY)
+    return HTMLResponse(_render_prompts_settings_page(prompts, added=bool(added), deleted=bool(deleted)))
+
+
+@app.post("/_content/settings/prompts/add")
+def settings_prompts_add(request: Request, topic: str = Form(""), prompt: str = Form(...)):
+    if not _require_login(request):
+        return RedirectResponse("/login", status_code=303)
+    settings_store.add_prompt(config.SUPABASE_URL, config.SUPABASE_KEY, topic.strip(), prompt.strip())
+    return RedirectResponse("/_content/settings/prompts?added=1", status_code=303)
+
+
+@app.post("/_content/settings/prompts/{prompt_id}/toggle")
+def settings_prompts_toggle(request: Request, prompt_id: str):
+    if not _require_login(request):
+        return RedirectResponse("/login", status_code=303)
+    prompts = settings_store.list_prompts(config.SUPABASE_URL, config.SUPABASE_KEY)
+    current = next((p for p in prompts if str(p["id"]) == prompt_id), None)
+    if current is not None:
+        settings_store.set_prompt_archived(
+            config.SUPABASE_URL, config.SUPABASE_KEY, prompt_id, not current.get("archived")
+        )
+    return RedirectResponse("/_content/settings/prompts", status_code=303)
+
+
+@app.post("/_content/settings/prompts/{prompt_id}/delete")
+def settings_prompts_delete(request: Request, prompt_id: str):
+    if not _require_login(request):
+        return RedirectResponse("/login", status_code=303)
+    settings_store.delete_prompt(config.SUPABASE_URL, config.SUPABASE_KEY, prompt_id)
+    return RedirectResponse("/_content/settings/prompts?deleted=1", status_code=303)
 
 
 @app.get("/health", response_class=PlainTextResponse)

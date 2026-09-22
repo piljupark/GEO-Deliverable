@@ -64,19 +64,32 @@ def query_gemini(prompt_text, api_key, model="gemini-flash-latest"):
     return text, cited_urls
 
 
-def _name_variants(name, domain):
+def _as_list(x):
+    """문자열 하나든 리스트든 균일하게 리스트로. 등록된 브랜드 별칭·사이트 URL이
+    여러 개일 수 있어서(설정에서 여러 개 저장 가능) 단일 값만 받던 걸 일반화한다."""
+    if x is None:
+        return []
+    if isinstance(x, (list, tuple, set)):
+        return [v for v in x if v]
+    return [x] if x else []
+
+
+def _name_variants(names, domains=None):
     """
     브랜드명 하나만 정확히 일치시키면 재현율이 너무 낮다(제목 전체 vs AI가 짧게 부르는 이름).
     이름 전체, 이름의 첫 단어, 도메인의 대표 이름(예: kma.or.kr -> kma)까지 후보로 본다.
+    names/domains는 여러 개(등록된 별칭·여러 사이트 URL) 올 수 있어 전부 합친다.
     """
     variants = set()
-    name = (name or "").strip()
-    if name:
+    for name in _as_list(names):
+        name = name.strip()
+        if not name:
+            continue
         variants.add(name.lower())
         first_word = name.split()[0] if " " in name else name
         if len(first_word) >= 2:
             variants.add(first_word.lower())
-    if domain:
+    for domain in _as_list(domains):
         bare = _domain(domain).split(".")[0]
         if len(bare) >= 2:
             variants.add(bare.lower())
@@ -87,7 +100,8 @@ def detect_mentions(text, cited_urls, brand_name, brand_domain, competitors=None
     """
     text: Gemini 응답 텍스트
     cited_urls: grounding에서 뽑힌 인용 URL 목록
-    competitors: [{"name": str, "domain": str}, ...]
+    brand_name/brand_domain: 문자열 하나 또는 리스트(등록된 별칭·사이트가 여러 개일 수 있음)
+    competitors: [{"name": str, "domain": str, "aliases": [str, ...]}, ...]
     """
     competitors = competitors or []
     text_low = text.lower()
@@ -95,13 +109,15 @@ def detect_mentions(text, cited_urls, brand_name, brand_domain, competitors=None
 
     brand_terms = _name_variants(brand_name, brand_domain)
     mentioned = any(t in text_low for t in brand_terms)
-    cited = bool(brand_domain) and _domain(brand_domain) in cited_domains
+    brand_domain_set = {_domain(d) for d in _as_list(brand_domain)}
+    cited = bool(brand_domain_set) and bool(brand_domain_set & set(cited_domains))
 
     competitor_mentions = {}
     competitor_citations = {}
     for c in competitors:
         name, domain = c.get("name", ""), c.get("domain", "")
-        terms = _name_variants(name, domain)
+        aliases = c.get("aliases") or []
+        terms = _name_variants([name] + list(aliases), domain)
         competitor_mentions[name or domain] = any(t in text_low for t in terms)
         competitor_citations[name or domain] = bool(domain) and _domain(domain) in cited_domains
 
@@ -185,6 +201,8 @@ def _run_one(prompt, api_key, model, brand_name, brand_domain, competitors):
 def run_geo_visibility(prompts, api_key, model, brand_name, brand_domain, competitors=None):
     """
     prompts: 추적할 질문 문자열 리스트
+    brand_name/brand_domain: 문자열 하나 또는 리스트 — 등록된 브랜드 별칭·사이트 URL이
+    여러 개면 리스트로 넘기면 전부 "자사"로 인식된다.
     반환: 프롬프트별 결과 레코드 리스트. 실패한 프롬프트는 mentioned/cited가 모두 None이고
     status가 "ERROR:..."로 시작한다 — 가짜 값으로 채우지 않는다.
     각 프롬프트는 서로 독립적인 API 호출이라 동시에 실행해서 대기시간을 줄인다.
