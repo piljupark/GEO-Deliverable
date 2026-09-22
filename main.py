@@ -110,7 +110,7 @@ def removed_feature_redirect():
 
 
 @app.get("/_content/analyze", response_class=HTMLResponse)
-def analyze_content(request: Request, url: str = ""):
+def analyze_content(request: Request, url: str = "", competitors: str = ""):
     if not _require_login(request):
         return RedirectResponse("/login", status_code=303)
 
@@ -131,7 +131,7 @@ def analyze_content(request: Request, url: str = ""):
     except Exception as e:
         return HTMLResponse(ANALYZE_FORM_TEMPLATE.replace(
             "{error}", f"<div class='err'>크롤 실패: {type(e).__name__} — URL을 확인해주세요.</div>"
-        ).replace("{prev_url}", target))
+        ).replace("{prev_url}", target).replace("{prev_competitors}", html.escape(competitors)))
 
     scores = score_categories(tech)
     psi = collect_pagespeed(target, api_key=config.PAGESPEED_API_KEY or None)
@@ -145,6 +145,24 @@ def analyze_content(request: Request, url: str = ""):
     # 지금 이 사이트에 실제로 뭐가 있는지(robots.txt/llms.txt/sitemap.xml/JSON-LD) 확인.
     # 아래 artifacts는 우리가 만든 "권장안"이고, 이건 그 반대 — 실제 현황.
     geo_status = check_current_geo_status(target, r.text)
+
+    # 경쟁사 비교 (선택, 최대 2개) — 무료 쿼터 보호를 위해 상한을 둔다.
+    # SEO 점수는 크롤링만 하면 되니 추가 API 비용이 없고, AI 노출은 자사와 같은 질문
+    # 세트로 한 번에 묻기 때문에(run_geo_visibility의 competitors 인자) Gemini 호출이 늘지 않는다.
+    competitor_urls = [c.strip() for c in competitors.split(",") if c.strip()][:2]
+    competitor_data = []
+    for curl in competitor_urls:
+        cnorm = curl if curl.startswith("http") else "https://" + curl
+        try:
+            cr = _rq.get(cnorm, headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT)
+            ctech = audit_technical(cr.url, cr.text)
+            competitor_data.append({
+                "url": cnorm, "error": None,
+                "scores": score_categories(ctech),
+                "brand": guess_brand_name(ctech) or cnorm,
+            })
+        except Exception as e:
+            competitor_data.append({"url": cnorm, "error": f"{type(e).__name__}: {e}", "scores": None, "brand": cnorm})
 
     # 점수 카드 HTML
     score_cards = ""
@@ -247,6 +265,30 @@ def analyze_content(request: Request, url: str = ""):
       {improve_rows}
     </div>"""
 
+    # 경쟁사 SEO/GEO 점수 비교 카드 (경쟁사를 입력했을 때만)
+    competitor_score_section = ""
+    if competitor_data:
+        rows = f"""
+        <div class="cmp-row cmp-head"><div>사이트</div><div>검색·AI 접근</div><div>콘텐츠 품질</div><div>브랜드·구조화</div></div>
+        <div class="cmp-row"><div>{html.escape(target)} (자사)</div>
+          <div>{scores['access']['score']}</div><div>{scores['content']['score']}</div><div>{scores['brand']['score']}</div>
+        </div>"""
+        for c in competitor_data:
+            if c["error"]:
+                rows += f"""
+                <div class="cmp-row"><div>{html.escape(c['url'])}</div><div class="cmp-err" style="grid-column:span 3">크롤 실패: {html.escape(c['error'])}</div></div>"""
+            else:
+                s = c["scores"]
+                rows += f"""
+                <div class="cmp-row"><div>{html.escape(c['url'])}</div>
+                  <div>{s['access']['score']}</div><div>{s['content']['score']}</div><div>{s['brand']['score']}</div>
+                </div>"""
+        competitor_score_section = f"""
+        <div class="card">
+          <h2>경쟁사 비교 — SEO/GEO 점수</h2>
+          {rows}
+        </div>"""
+
     # AI 노출(Gemini) — 크롤링한 사이트 정보로 질문을 자동 생성해서 실제로 Gemini에 물어봄.
     # mock 없음: 키가 없거나 실패하면 명확한 안내만 표시하고 가짜 점수는 절대 채우지 않는다.
     # 경쟁사도 고정 목록을 쓰지 않는다 — 분석 대상이 매번 바뀌는데 고정 경쟁사를 대입하면 무의미하다.
@@ -259,9 +301,13 @@ def analyze_content(request: Request, url: str = ""):
     else:
         try:
             gen_prompts = generate_prompts(tech, config.GEMINI_API_KEY, config.GEMINI_MODEL, count=3)
+            competitors_for_gemini = [
+                {"name": c["brand"], "domain": c["url"]} for c in competitor_data if not c["error"]
+            ]
             geo = run_geo_visibility(
                 gen_prompts, config.GEMINI_API_KEY, config.GEMINI_MODEL,
                 brand_name=brand_name, brand_domain=target,
+                competitors=competitors_for_gemini,
             )
             live = [r for r in geo["records"] if r["status"] == "LIVE"]
             total = len(live)
@@ -270,18 +316,44 @@ def analyze_content(request: Request, url: str = ""):
             exposure_score = round(mentioned_count / total * 100) if total else None
             citation_share = round(cited_count / total * 100) if total else None
 
+            # 경쟁사별 노출도/인용 점유율 — 자사와 같은 질문 세트를 같은 응답에서 함께 판별한 것.
+            comparison_rows = ""
+            if competitors_for_gemini:
+                comparison_rows += f"""
+                <div class="share-row"><span>{html.escape(brand_name)} (자사)</span>
+                  <span>노출 {exposure_score if exposure_score is not None else "—"}% · 인용 {citation_share if citation_share is not None else "—"}%</span></div>"""
+                for comp in competitors_for_gemini:
+                    name = comp["name"]
+                    cm = sum(1 for r in live if r["competitor_mentions"].get(name))
+                    cc = sum(1 for r in live if r["competitor_citations"].get(name))
+                    ce = round(cm / total * 100) if total else None
+                    cs = round(cc / total * 100) if total else None
+                    comparison_rows += f"""
+                    <div class="share-row"><span>{html.escape(name)}</span>
+                      <span>노출 {ce if ce is not None else "—"}% · 인용 {cs if cs is not None else "—"}%</span></div>"""
+
             geo_rows = ""
             for r in geo["records"]:
                 if r["status"] != "LIVE":
                     status_html = f'<span class="tag tag-err">실패: {html.escape(r["detail"])}</span>'
-                else:
-                    m = '<span class="tag tag-yes">언급됨</span>' if r["mentioned"] else '<span class="tag tag-no">언급 없음</span>'
-                    c = '<span class="tag tag-yes">인용됨</span>' if r["cited"] else '<span class="tag tag-no">인용 없음</span>'
-                    status_html = m + c
+                    geo_rows += f"""
+                    <div class="prompt-row">
+                      <div class="prompt-text">{html.escape(r['prompt'])}</div>
+                      <div class="prompt-status">{status_html}</div>
+                    </div>"""
+                    continue
+                m = '<span class="tag tag-yes">언급됨</span>' if r["mentioned"] else '<span class="tag tag-no">언급 없음</span>'
+                c = '<span class="tag tag-yes">인용됨</span>' if r["cited"] else '<span class="tag tag-no">인용 없음</span>'
+                sites_html = f'<div class="prompt-site"><span class="site-label">자사</span>{m}{c}</div>'
+                for comp in competitors_for_gemini:
+                    name = comp["name"]
+                    cm = '<span class="tag tag-yes">언급됨</span>' if r["competitor_mentions"].get(name) else '<span class="tag tag-no">언급 없음</span>'
+                    cc2 = '<span class="tag tag-yes">인용됨</span>' if r["competitor_citations"].get(name) else '<span class="tag tag-no">인용 없음</span>'
+                    sites_html += f'<div class="prompt-site"><span class="site-label">{html.escape(name)}</span>{cm}{cc2}</div>'
                 geo_rows += f"""
                 <div class="prompt-row">
                   <div class="prompt-text">{html.escape(r['prompt'])}</div>
-                  <div class="prompt-status">{status_html}</div>
+                  <div class="prompt-sites">{sites_html}</div>
                 </div>"""
 
             geo_section = f"""
@@ -298,6 +370,7 @@ def analyze_content(request: Request, url: str = ""):
                   <div class="score-num">{citation_share if citation_share is not None else "—"}<span>/100</span></div>
                 </div>
               </div>
+              {comparison_rows}
               {geo_rows}
             </div>"""
         except Exception as e:
@@ -312,6 +385,7 @@ def analyze_content(request: Request, url: str = ""):
         score_cards=score_cards,
         issue_rows=issue_rows,
         geo_status_section=geo_status_section,
+        competitor_score_section=competitor_score_section,
         geo_section=geo_section,
         robots=_esc_html(artifacts["robots_txt"]),
         llms=_esc_html(artifacts["llms_txt"]),
@@ -341,22 +415,37 @@ button{width:100%;padding:11px;background:#14161A;color:#fff;border:none;
 button:disabled{opacity:.6;cursor:default}
 .err{color:#c5221f;font-size:12.5px;margin-bottom:10px}
 .wait-note{display:none;margin-top:10px;font-size:12px;color:#5B5F66;text-align:center}
+label.sub-label{display:block;font-size:11.5px;color:#9A9DA3;margin:2px 0 6px}
 </style></head><body>
 <form class="box" method="get" action="/_content/analyze" onsubmit="
   var b=this.querySelector('button');
   b.disabled=true; b.innerText='분석 중입니다...';
   this.querySelector('.wait-note').style.display='block';
+  try{localStorage.setItem('geo_competitors', this.competitors.value);}catch(e){}
 ">
   <h1>URL 분석</h1>
   <p>분석할 사이트 주소를 입력하면 기술 진단과 GEO 산출물을 바로 생성합니다.</p>
   {error}
   <input name="url" placeholder="https://example.com" value="{prev_url}" autofocus>
+  <label class="sub-label">경쟁사 URL (선택, 쉼표로 구분, 최대 2개) — 한 번 넣으면 다음에도 기억합니다</label>
+  <input name="competitors" placeholder="https://competitor1.com, https://competitor2.com" value="{prev_competitors}">
   <button type="submit">분석하기</button>
-  <div class="wait-note">사이트 크롤링·현재 GEO 상태·웹 성능·AI 노출 확인을 순서대로 진행합니다. 최대 1~2분 정도 걸릴 수 있어요.</div>
+  <div class="wait-note">사이트 크롤링·현재 GEO 상태·웹 성능·AI 노출 확인을 순서대로 진행합니다. 경쟁사를 넣으면 더 걸릴 수 있어요.</div>
 </form>
+<script>
+(function(){
+  var el = document.querySelector('input[name="competitors"]');
+  if (el && !el.value) {
+    try {
+      var saved = localStorage.getItem('geo_competitors');
+      if (saved) el.value = saved;
+    } catch (e) {}
+  }
+})();
+</script>
 </body></html>
 """
-ANALYZE_FORM_PAGE = ANALYZE_FORM_TEMPLATE.replace("{error}", "").replace("{prev_url}", "")
+ANALYZE_FORM_PAGE = ANALYZE_FORM_TEMPLATE.replace("{error}", "").replace("{prev_url}", "").replace("{prev_competitors}", "")
 
 
 ANALYZE_RESULT_PAGE = """
@@ -397,6 +486,16 @@ a.reanalyze{{font-size:12.5px;color:var(--ink);border-bottom:1px solid var(--lin
 .tag-yes{{background:#E6F4EC;color:#1E5E46}}
 .tag-no{{background:#F0F0EE;color:var(--dim)}}
 .tag-err{{background:#FBE9E7;color:#c5221f}}
+.share-row{{display:flex;justify-content:space-between;padding:8px 0;border-top:1px solid #ECECE9;font-size:13px}}
+.share-row:first-child{{border-top:none}}
+.cmp-row{{display:grid;grid-template-columns:2fr 1fr 1fr 1fr;gap:8px;padding:10px 0;
+  border-top:1px solid #ECECE9;font-size:13px;align-items:center}}
+.cmp-row:first-child{{border-top:none}}
+.cmp-head{{font-weight:500;color:var(--dim);font-size:11.5px}}
+.cmp-err{{color:#c5221f;font-size:12px}}
+.prompt-sites{{display:flex;flex-direction:column;gap:5px;align-items:flex-end;flex:0 0 auto}}
+.prompt-site{{display:flex;align-items:center;gap:6px;font-size:11px}}
+.site-label{{color:var(--dim2);min-width:60px;text-align:right}}
 .card-h{{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}}
 button.copy{{border:1px solid var(--ink);background:transparent;color:var(--ink);
   padding:5px 12px;font-size:12px;border-radius:2px;cursor:pointer}}
@@ -415,6 +514,7 @@ pre{{background:#F3F3F1;border:1px solid var(--line);border-radius:2px;padding:1
     {issue_rows}
   </div>
   {geo_status_section}
+  {competitor_score_section}
   {geo_section}
   <div class="card">
     <div class="card-h"><h2>권장 robots.txt</h2><button class="copy" onclick="cp('r')">복사</button></div>
