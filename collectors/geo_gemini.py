@@ -31,7 +31,7 @@ def guess_brand_name(tech):
     return title
 
 
-def query_gemini(prompt_text, api_key, model="gemini-2.5-flash"):
+def query_gemini(prompt_text, api_key, model="gemini-flash-latest"):
     """
     Gemini에 프롬프트 1개를 실제로 던지고 (Google Search grounding 활성화),
     응답 텍스트와 인용 URL 목록을 반환한다. 실패 시 예외를 그대로 올린다.
@@ -41,7 +41,9 @@ def query_gemini(prompt_text, api_key, model="gemini-2.5-flash"):
         "contents": [{"parts": [{"text": prompt_text}]}],
         "tools": [{"google_search": {}}],
     }
-    resp = requests.post(url, params={"key": api_key}, json=body, timeout=30)
+    # 쿼리파라미터(?key=)가 아니라 헤더로 인증해야 한다 — 안 그러면 401/404가 난다.
+    headers = {"Content-Type": "application/json", "X-goog-api-key": api_key}
+    resp = requests.post(url, headers=headers, json=body, timeout=30)
     resp.raise_for_status()
     data = resp.json()
 
@@ -109,7 +111,7 @@ def detect_mentions(text, cited_urls, brand_name, brand_domain, competitors=None
     }
 
 
-def generate_prompts(tech, api_key, model="gemini-2.5-flash", count=5):
+def generate_prompts(tech, api_key, model="gemini-flash-latest", count=5):
     """
     크롤링된 사이트 정보(title/meta_desc/h1_texts)를 바탕으로, 이 사이트의 잠재 고객이
     AI 챗봇에게 물어볼 법한 자연어 질문을 Gemini로 자동 생성한다 (grounding 없이 순수 생성).
@@ -128,7 +130,8 @@ def generate_prompts(tech, api_key, model="gemini-2.5-flash", count=5):
     )
     url = ENDPOINT_TMPL.format(model=model)
     body = {"contents": [{"parts": [{"text": ask}]}]}
-    resp = requests.post(url, params={"key": api_key}, json=body, timeout=30)
+    headers = {"Content-Type": "application/json", "X-goog-api-key": api_key}
+    resp = requests.post(url, headers=headers, json=body, timeout=30)
     resp.raise_for_status()
     data = resp.json()
 
