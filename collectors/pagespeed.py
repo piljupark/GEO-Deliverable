@@ -13,15 +13,12 @@ from datetime import datetime, timezone
 ENDPOINT = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
 
 
-def collect_pagespeed(url, api_key=None, strategy="mobile", mock=False):
+def collect_pagespeed(url, api_key=None, strategy="mobile"):
     """
     url: 분석할 페이지 주소
     strategy: "mobile" 또는 "desktop" — 모바일 우선이 기본(구글 검색도 모바일 우선 색인)
-    mock: True면 API 호출 없이 데모 값 반환
+    항상 실제 API를 호출한다. api_key가 없어도 쿼터만 낮을 뿐 호출은 그대로 시도한다.
     """
-    if mock:
-        return _mock_pagespeed(url)
-
     params = {
         "url": url,
         "strategy": strategy,
@@ -69,15 +66,4 @@ def collect_pagespeed(url, api_key=None, strategy="mobile", mock=False):
         "lcp": _audit_value("largest-contentful-paint"),
         "cls": _audit_value("cumulative-layout-shift"),
         "tbt": _audit_value("total-blocking-time"),
-    }
-
-
-def _mock_pagespeed(url):
-    return {
-        "source": "MOCK",
-        "fetched_at": datetime.now(timezone.utc).isoformat(),
-        "strategy": "mobile",
-        "performance": 62, "accessibility": 88,
-        "best_practices": 79, "seo": 91,
-        "lcp": "3.2 s", "cls": "0.08", "tbt": "310 ms",
     }

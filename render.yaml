@@ -38,10 +38,9 @@ services:
         sync: false
       - key: MY_URL
         sync: false
+      # 선택 항목: API 키 없이도 작동하지만, 키를 넣으면 더 많이 호출 가능
       - key: PAGESPEED_API_KEY
         sync: false
-      - key: PAGESPEED_MOCK
-        value: "true"
       - key: COMPETITOR_URLS
         sync: false
       - key: TARGET_KEYWORDS

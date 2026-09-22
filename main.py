@@ -382,8 +382,7 @@ def analyze_content(request: Request, url: str = ""):
     scores = score_categories(tech)
 
     from collectors.pagespeed import collect_pagespeed
-    psi = collect_pagespeed(target, api_key=config.PAGESPEED_API_KEY or None,
-                             mock=config.PAGESPEED_MOCK or not config.PAGESPEED_API_KEY)
+    psi = collect_pagespeed(target, api_key=config.PAGESPEED_API_KEY or None)
 
     rx = prescribe(tech=tech)
     artifacts = generate_all(tech, brand_name=config.BRAND_NAME or None,
@@ -399,14 +398,15 @@ def analyze_content(request: Request, url: str = ""):
           <div class="score-tier">{score_tier(s['score'])}</div>
         </div>"""
 
-    # 웹 성능 카드 — PageSpeed Insights(Lighthouse) 실측값
-    if psi["performance"] is None:
-        score_cards += """
+    # 웹 성능 카드 — PageSpeed Insights(Lighthouse) 실측값. LIVE일 때만 점수를 보여준다.
+    if psi["source"].startswith("ERROR"):
+        score_cards += f"""
         <div class="score-card">
           <div class="score-label">웹 성능</div>
           <div class="score-num">측정 실패</div>
+          <div class="score-detail">{html.escape(psi.get('detail') or '알 수 없는 오류')}</div>
         </div>"""
-    else:
+    elif psi["source"] == "LIVE":
         lcp = psi["lcp"] if psi["lcp"] is not None else "—"
         cls = psi["cls"] if psi["cls"] is not None else "—"
         tbt = psi["tbt"] if psi["tbt"] is not None else "—"
