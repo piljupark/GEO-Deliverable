@@ -16,6 +16,7 @@ URL 즉석분석 웹앱.
 """
 
 import html
+from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import FastAPI, Request, Form
 from fastapi.responses import HTMLResponse, RedirectResponse, PlainTextResponse
@@ -134,7 +135,6 @@ def analyze_content(request: Request, url: str = "", competitors: str = ""):
         ).replace("{prev_url}", target).replace("{prev_competitors}", html.escape(competitors)))
 
     scores = score_categories(tech)
-    psi = collect_pagespeed(target, api_key=config.PAGESPEED_API_KEY or None)
     rx = prescribe(tech=tech)
 
     # 브랜드명은 매번 크롤링한 이 URL의 실제 정보에서만 뽑는다 — 관리자가 설정한
@@ -142,27 +142,39 @@ def analyze_content(request: Request, url: str = "", competitors: str = ""):
     brand_name = guess_brand_name(tech) or target
     artifacts = generate_all(tech, brand_name=brand_name or None, social_urls=None)
 
-    # 지금 이 사이트에 실제로 뭐가 있는지(robots.txt/llms.txt/sitemap.xml/JSON-LD) 확인.
-    # 아래 artifacts는 우리가 만든 "권장안"이고, 이건 그 반대 — 실제 현황.
-    geo_status = check_current_geo_status(target, r.text)
-
-    # 경쟁사 비교 (선택, 최대 2개) — 무료 쿼터 보호를 위해 상한을 둔다.
-    # SEO 점수는 크롤링만 하면 되니 추가 API 비용이 없고, AI 노출은 자사와 같은 질문
-    # 세트로 한 번에 묻기 때문에(run_geo_visibility의 competitors 인자) Gemini 호출이 늘지 않는다.
     competitor_urls = [c.strip() for c in competitors.split(",") if c.strip()][:2]
-    competitor_data = []
-    for curl in competitor_urls:
+
+    def _crawl_competitor(curl):
         cnorm = curl if curl.startswith("http") else "https://" + curl
         try:
             cr = _rq.get(cnorm, headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT)
             ctech = audit_technical(cr.url, cr.text)
-            competitor_data.append({
-                "url": cnorm, "error": None,
-                "scores": score_categories(ctech),
-                "brand": guess_brand_name(ctech) or cnorm,
-            })
+            return {"url": cnorm, "error": None, "scores": score_categories(ctech),
+                    "brand": guess_brand_name(ctech) or cnorm}
         except Exception as e:
-            competitor_data.append({"url": cnorm, "error": f"{type(e).__name__}: {e}", "scores": None, "brand": cnorm})
+            return {"url": cnorm, "error": f"{type(e).__name__}: {e}", "scores": None, "brand": cnorm}
+
+    # PageSpeed·현재 GEO 상태 확인·경쟁사 크롤링·Gemini 질문 생성은 서로 의존관계가
+    # 없는 독립적인 외부 호출이라 순서대로 기다릴 필요가 없다 — 동시에 실행해서
+    # 전체 대기시간을 "합계"가 아니라 "가장 느린 것 하나" 수준으로 줄인다.
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        fut_psi = ex.submit(collect_pagespeed, target, api_key=config.PAGESPEED_API_KEY or None)
+        fut_geo_status = ex.submit(check_current_geo_status, target, r.text)
+        fut_competitors = [ex.submit(_crawl_competitor, c) for c in competitor_urls]
+        fut_prompts = (
+            ex.submit(generate_prompts, tech, config.GEMINI_API_KEY, config.GEMINI_MODEL, count=3)
+            if config.GEMINI_API_KEY else None
+        )
+
+        psi = fut_psi.result()
+        geo_status = fut_geo_status.result()
+        competitor_data = [f.result() for f in fut_competitors]
+        gen_prompts, gen_prompts_error = None, None
+        if fut_prompts is not None:
+            try:
+                gen_prompts = fut_prompts.result()
+            except Exception as e:
+                gen_prompts_error = e
 
     # 점수 카드 HTML
     score_cards = ""
@@ -307,7 +319,8 @@ def analyze_content(request: Request, url: str = "", competitors: str = ""):
         </div>"""
     else:
         try:
-            gen_prompts = generate_prompts(tech, config.GEMINI_API_KEY, config.GEMINI_MODEL, count=3)
+            if gen_prompts_error:
+                raise gen_prompts_error
             competitors_for_gemini = [
                 {"name": c["brand"], "domain": c["url"]} for c in competitor_data if not c["error"]
             ]

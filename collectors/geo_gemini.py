@@ -8,6 +8,7 @@ mock 없음 — 실패하면 가짜 값 대신 명확한 ERROR 상태를 반환�
 """
 
 import re
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
@@ -152,40 +153,51 @@ def generate_prompts(tech, api_key, model="gemini-flash-latest", count=5):
     return lines[:count]
 
 
+def _run_one(prompt, api_key, model, brand_name, brand_domain, competitors):
+    try:
+        text, cited_urls = query_gemini(prompt, api_key, model=model)
+        m = detect_mentions(text, cited_urls, brand_name, brand_domain, competitors)
+        return {
+            "prompt": prompt,
+            "status": "LIVE",
+            "mentioned": m["mentioned"],
+            "cited": m["cited"],
+            "cited_urls": cited_urls,
+            "competitor_mentions": m["competitor_mentions"],
+            "competitor_citations": m["competitor_citations"],
+            "answer_preview": text[:300],
+            "detail": "",
+        }
+    except Exception as e:
+        return {
+            "prompt": prompt,
+            "status": f"ERROR:{type(e).__name__}",
+            "mentioned": None,
+            "cited": None,
+            "cited_urls": [],
+            "competitor_mentions": {},
+            "competitor_citations": {},
+            "answer_preview": "",
+            "detail": str(e),
+        }
+
+
 def run_geo_visibility(prompts, api_key, model, brand_name, brand_domain, competitors=None):
     """
     prompts: 추적할 질문 문자열 리스트
     반환: 프롬프트별 결과 레코드 리스트. 실패한 프롬프트는 mentioned/cited가 모두 None이고
     status가 "ERROR:..."로 시작한다 — 가짜 값으로 채우지 않는다.
+    각 프롬프트는 서로 독립적인 API 호출이라 동시에 실행해서 대기시간을 줄인다.
     """
-    records = []
-    for prompt in prompts:
-        try:
-            text, cited_urls = query_gemini(prompt, api_key, model=model)
-            m = detect_mentions(text, cited_urls, brand_name, brand_domain, competitors)
-            records.append({
-                "prompt": prompt,
-                "status": "LIVE",
-                "mentioned": m["mentioned"],
-                "cited": m["cited"],
-                "cited_urls": cited_urls,
-                "competitor_mentions": m["competitor_mentions"],
-                "competitor_citations": m["competitor_citations"],
-                "answer_preview": text[:300],
-                "detail": "",
-            })
-        except Exception as e:
-            records.append({
-                "prompt": prompt,
-                "status": f"ERROR:{type(e).__name__}",
-                "mentioned": None,
-                "cited": None,
-                "cited_urls": [],
-                "competitor_mentions": {},
-                "competitor_citations": {},
-                "answer_preview": "",
-                "detail": str(e),
-            })
+    if not prompts:
+        records = []
+    elif len(prompts) == 1:
+        records = [_run_one(prompts[0], api_key, model, brand_name, brand_domain, competitors)]
+    else:
+        with ThreadPoolExecutor(max_workers=len(prompts)) as ex:
+            records = list(ex.map(
+                lambda p: _run_one(p, api_key, model, brand_name, brand_domain, competitors), prompts
+            ))
     return {
         "platform": "gemini",
         "fetched_at": datetime.now(timezone.utc).isoformat(),

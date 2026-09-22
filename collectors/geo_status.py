@@ -7,6 +7,7 @@ JSON-LD가 실제로 박혀 있는지를 있는 그대로 확인한다. mock 없
 
 import json
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
 from urllib.robotparser import RobotFileParser
 
@@ -114,10 +115,15 @@ def extract_existing_jsonld(html):
 
 
 def check_current_geo_status(url, html):
-    """robots/llms/sitemap/JSON-LD 실제 상태를 한 번에 모아서 반환."""
-    return {
-        "robots": check_robots_txt(url),
-        "llms": check_llms_txt(url),
-        "sitemap": check_sitemap(url),
-        "jsonld": extract_existing_jsonld(html),
-    }
+    """robots/llms/sitemap/JSON-LD 실제 상태를 한 번에 모아서 반환.
+    robots/llms/sitemap은 서로 독립적인 요청이라 동시에 가져온다."""
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        fut_robots = ex.submit(check_robots_txt, url)
+        fut_llms = ex.submit(check_llms_txt, url)
+        fut_sitemap = ex.submit(check_sitemap, url)
+        return {
+            "robots": fut_robots.result(),
+            "llms": fut_llms.result(),
+            "sitemap": fut_sitemap.result(),
+            "jsonld": extract_existing_jsonld(html),
+        }
