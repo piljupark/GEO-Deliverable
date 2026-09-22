@@ -12,43 +12,9 @@ services:
         sync: false
       - key: SESSION_SECRET
         generateValue: true
-      - key: REFRESH_TOKEN
-        sync: false
-      - key: GSC_SITE_URL
-        sync: false
-      - key: GSC_MOCK
-        value: "true"
-      - key: GSC_SERVICE_ACCOUNT_JSON
-        sync: false
-      - key: GA4_PROPERTY_ID
-        sync: false
-      - key: GA4_MOCK
-        value: "true"
-      - key: GA4_SERVICE_ACCOUNT_JSON
-        sync: false
-      - key: NAVER_API_KEY
-        sync: false
-      - key: NAVER_SECRET_KEY
-        sync: false
-      - key: NAVER_CUSTOMER_ID
-        sync: false
-      - key: NAVER_MOCK
-        value: "true"
-      - key: SERPAPI_KEY
-        sync: false
-      - key: MY_URL
-        sync: false
       # 선택 항목: API 키 없이도 작동하지만, 키를 넣으면 더 많이 호출 가능
       - key: PAGESPEED_API_KEY
-        sync: false
-      - key: COMPETITOR_URLS
-        sync: false
-      - key: COMPETITOR_NAMES
-        sync: false
-      - key: TARGET_KEYWORDS
         sync: false
       # 무료 발급: aistudio.google.com/apikey (카드 불필요). /analyze의 AI 노출 체크에 사용
       - key: GEMINI_API_KEY
         sync: false
-      - key: DB_PATH
-        value: "/opt/render/project/src/app.db"

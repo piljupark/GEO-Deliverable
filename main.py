@@ -1,49 +1,37 @@
 """
-Signal 대시보드 웹앱.
-로컬 스크립트(run_gsc.py, run_ads.py)를 웹서비스로 감싼 버전.
+URL 즉석분석 웹앱.
+로그인한 사용자가 아무 URL이나 입력하면 그 자리에서 크롤링해서
+기술 SEO 점수 · 웹 성능(PageSpeed) · AI 노출(Gemini) · GEO 산출물(robots.txt/llms.txt/JSON-LD)을
+전부 실데이터로 보여준다. 계정 인증이 필요한 서비스(GSC/GA4/네이버 등)는 애초에
+"임의의 URL"에 적용할 수 없는 구조라 이 앱에는 없다 — 소유권 인증 없이는 그 데이터를
+아무도 내줄 수 없기 때문.
 
 라우트:
   GET  /login          로그인 폼
   POST /login          로그인 처리
   GET  /logout
-  GET  /                URL 즉석분석 (메인, 로그인 필요) — AI 노출/기술 SEO/웹 성능
-  GET  /monitor          검색성과+처방 대시보드, 내 사이트 모니터링용 (로그인 필요)
-  GET  /ads              GA4+광고 리포트 (로그인 필요)
-  GET  /artifacts         내 사이트 GEO 산출물 (로그인 필요)
-  GET  /refresh?token=..  데이터 새로고침 (cron-job.org가 호출, REFRESH_TOKEN으로 보호)
+  GET  /                URL 즉석분석 셸 (로그인 필요)
+  GET  /_content/analyze  실제 분석 처리 (iframe 안에서 로드됨)
+  GET  /health
 """
 
 import html
-import os
-import tempfile
-from datetime import datetime, timezone
 
 from fastapi import FastAPI, Request, Form
 from fastapi.responses import HTMLResponse, RedirectResponse, PlainTextResponse
 from starlette.middleware.sessions import SessionMiddleware
 
 import config
-import db
-from collectors.gsc import collect_gsc
-from collectors.ga4 import collect_ga4
-from collectors.naver_ads import collect_naver_ads
-from collectors.insights import build_insights
 from collectors.tech_audit import audit_technical
 from collectors.prescribe import prescribe
-from collectors.serp import rank_keywords
-from collectors.competitor import compare_sites
-from collectors.tracker import growth_summary
+from collectors.pagespeed import collect_pagespeed
 from collectors.geo_gemini import generate_prompts, run_geo_visibility, guess_brand_name
 from generators.artifacts import generate_all
 from generators.scoring import score_categories, score_tier
 from layout import sidebar_shell
-from render_gsc import render_gsc
-from render_ads import render_ads_report
 
 app = FastAPI()
 app.add_middleware(SessionMiddleware, secret_key=config.SESSION_SECRET)
-
-db.init_db()
 
 
 # ---------------- 인증 ----------------
@@ -68,7 +56,7 @@ button{{width:100%;padding:10px;background:#14161A;color:#fff;border:none;
 .err{{color:#c5221f;font-size:12.5px;margin-bottom:10px}}
 </style></head><body>
 <form class="box" method="post" action="/login">
-  <h1>Signal 로그인</h1>
+  <h1>로그인</h1>
   {error}
   <input name="username" placeholder="아이디" autofocus>
   <input name="password" type="password" placeholder="비밀번호">
@@ -99,274 +87,7 @@ def logout(request: Request):
     return RedirectResponse("/login", status_code=303)
 
 
-# ---------------- 검색 성과 대시보드 (내 사이트 모니터링) ----------------
-
-@app.get("/monitor", response_class=HTMLResponse)
-def dashboard_shell(request: Request):
-    if not _require_login(request):
-        return RedirectResponse("/login", status_code=303)
-    return HTMLResponse(sidebar_shell("dashboard", "/_content/dashboard", title="검색 성과"))
-
-
-@app.get("/_content/dashboard", response_class=HTMLResponse)
-def dashboard(request: Request):
-    if not _require_login(request):
-        return RedirectResponse("/login", status_code=303)
-
-    gsc_snap = db.latest_snapshot("gsc")
-    if not gsc_snap:
-        return HTMLResponse(
-            "<p style='font-family:sans-serif;padding:40px'>아직 데이터가 없습니다. "
-            "<a href='/refresh?token=" + config.REFRESH_TOKEN + "'>지금 새로고침</a></p>"
-        )
-    gsc = gsc_snap["data"]
-    insights = build_insights(gsc)
-
-    tech_snap = db.latest_snapshot("tech")
-    tech = tech_snap["data"] if tech_snap else None
-
-    comp_snap = db.latest_snapshot("competitors")
-    competitors = comp_snap["data"] if comp_snap else None
-
-    serp_snap = db.latest_snapshot("serp")
-    serp = serp_snap["data"] if serp_snap else None
-
-    prescription = prescribe(tech=tech, gsc=gsc, insights=insights)
-
-    # 성장 추적: DB의 keyword_history를 growth_summary 형태로 변환
-    growth = None
-    if config.TARGET_KEYWORDS:
-        history_map = {}
-        for kw in config.TARGET_KEYWORDS:
-            points = db.keyword_history(kw)
-            history_map[kw] = [
-                {"date": p["date"], "impressions": p["impressions"], "clicks": p["clicks"],
-                 "gsc_position": p["gsc_position"], "serp_rank": p["serp_rank"]}
-                for p in points
-            ]
-        growth = growth_summary(history_map, config.TARGET_KEYWORDS)
-
-    with tempfile.NamedTemporaryFile(suffix=".html", delete=False, mode="w", encoding="utf-8") as f:
-        out_path = f.name
-    render_gsc(gsc, out_path, insights=insights, prescription=prescription,
-               competitors=competitors, serp=serp, growth=growth)
-    html = open(out_path, encoding="utf-8").read()
-    os.unlink(out_path)
-    return HTMLResponse(html)
-
-
-@app.get("/ads", response_class=HTMLResponse)
-def ads_shell(request: Request):
-    if not _require_login(request):
-        return RedirectResponse("/login", status_code=303)
-    return HTMLResponse(sidebar_shell("ads", "/_content/ads", title="광고 리포트"))
-
-
-@app.get("/_content/ads", response_class=HTMLResponse)
-def ads_report(request: Request):
-    if not _require_login(request):
-        return RedirectResponse("/login", status_code=303)
-
-    ga4_snap = db.latest_snapshot("ga4")
-    naver_snap = db.latest_snapshot("naver")
-    if not ga4_snap or not naver_snap:
-        return HTMLResponse(
-            "<p style='font-family:sans-serif;padding:40px'>아직 데이터가 없습니다. "
-            "<a href='/refresh?token=" + config.REFRESH_TOKEN + "'>지금 새로고침</a></p>"
-        )
-
-    with tempfile.NamedTemporaryFile(suffix=".html", delete=False, mode="w", encoding="utf-8") as f:
-        out_path = f.name
-    render_ads_report(ga4_snap["data"], naver_snap["data"], out_path,
-                       google_enabled=False, meta_enabled=False)
-    html = open(out_path, encoding="utf-8").read()
-    os.unlink(out_path)
-    return HTMLResponse(html)
-
-
-# ---------------- 새로고침 (cron-job.org가 호출) ----------------
-
-@app.get("/refresh", response_class=PlainTextResponse)
-def refresh(token: str = ""):
-    if not config.REFRESH_TOKEN or token != config.REFRESH_TOKEN:
-        return PlainTextResponse("forbidden", status_code=403)
-
-    log = []
-
-    # 1) GSC
-    gsc = collect_gsc(config.GSC_SITE_URL, auth=config.gsc_auth(), mock=config.GSC_MOCK)
-    db.save_snapshot("gsc", gsc)
-    log.append(f"GSC: {gsc['source']} 클릭 {gsc['totals']['clicks']}")
-
-    # 2) 기술 진단
-    try:
-        import requests as _rq
-        from collectors.onpage import USER_AGENT, TIMEOUT
-        r = _rq.get(config.MY_URL, headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT)
-        tech = audit_technical(r.url, r.text)
-        db.save_snapshot("tech", tech)
-        log.append(f"기술진단: H1 {tech['h1_count']}")
-
-        # 2-1) GEO 산출물(robots.txt/llms.txt/JSON-LD) 자동 생성 — LLM 미사용, 규칙 기반
-        artifacts = generate_all(tech, brand_name=config.BRAND_NAME or None,
-                                  social_urls=config.SOCIAL_URLS or None)
-        db.save_snapshot("artifacts", artifacts)
-        log.append("GEO 산출물 생성 완료")
-    except Exception as e:
-        log.append(f"기술진단 실패: {e}")
-
-    # 3) 경쟁사 비교
-    if config.COMPETITOR_URLS:
-        try:
-            competitors = compare_sites(config.MY_URL, config.COMPETITOR_URLS)
-            db.save_snapshot("competitors", competitors)
-            log.append(f"경쟁사 비교: {len(competitors)}개")
-        except Exception as e:
-            log.append(f"경쟁사 비교 실패: {e}")
-
-    # 4) SERP + 타겟 키워드 기록
-    if config.TARGET_KEYWORDS:
-        try:
-            serp = rank_keywords(config.TARGET_KEYWORDS,
-                                  config.GSC_SITE_URL.replace("sc-domain:", "").rstrip("/"),
-                                  api_key=config.SERPAPI_KEY or None)
-            db.save_snapshot("serp", serp)
-            log.append(f"SERP: {serp['quota_note']}")
-
-            today = datetime.now(timezone.utc).date().isoformat()
-            gsc_queries = {q["key"]: q for q in gsc.get("top_queries", [])}
-            serp_items = {it["keyword"]: it for it in serp["items"]}
-            for kw in config.TARGET_KEYWORDS:
-                gq = gsc_queries.get(kw)
-                si = serp_items.get(kw)
-                db.save_keyword_point(
-                    kw, today,
-                    impressions=gq["impressions"] if gq else 0,
-                    clicks=gq["clicks"] if gq else 0,
-                    gsc_position=gq["position"] if gq else None,
-                    serp_rank=si["my_rank"] if si else None,
-                )
-        except Exception as e:
-            log.append(f"SERP 실패: {e}")
-
-    # 5) GA4
-    ga4 = collect_ga4(config.GA4_PROPERTY_ID, auth=config.ga4_auth(), mock=config.GA4_MOCK)
-    db.save_snapshot("ga4", ga4)
-    log.append(f"GA4: {ga4['source']} 조회수 {ga4['totals']['views']}")
-
-    # 6) 네이버
-    naver = collect_naver_ads(auth=config.naver_auth(), mock=config.NAVER_MOCK)
-    db.save_snapshot("naver", naver)
-    log.append(f"네이버: {naver['source']}")
-
-    return PlainTextResponse("\n".join(log))
-
-
-def _build_competitors():
-    """COMPETITOR_URLS와 COMPETITOR_NAMES를 순서대로 짝지어 {name, domain} 리스트로."""
-    from urllib.parse import urlparse
-    out = []
-    for i, url in enumerate(config.COMPETITOR_URLS):
-        if i < len(config.COMPETITOR_NAMES):
-            name = config.COMPETITOR_NAMES[i]
-        else:
-            name = (urlparse(url).netloc or url).split(".")[0]
-        out.append({"name": name, "domain": url})
-    return out
-
-
-@app.get("/artifacts", response_class=HTMLResponse)
-def artifacts_shell(request: Request):
-    if not _require_login(request):
-        return RedirectResponse("/login", status_code=303)
-    return HTMLResponse(sidebar_shell("artifacts", "/_content/artifacts", title="홈페이지 분석"))
-
-
-@app.get("/_content/artifacts", response_class=HTMLResponse)
-def artifacts_page(request: Request):
-    if not _require_login(request):
-        return RedirectResponse("/login", status_code=303)
-
-    snap = db.latest_snapshot("artifacts")
-    if not snap:
-        return HTMLResponse(
-            "<p style='font-family:sans-serif;padding:40px'>아직 생성된 산출물이 없습니다. "
-            "<a href='/refresh?token=" + config.REFRESH_TOKEN + "'>지금 새로고침</a></p>"
-        )
-    a = snap["data"]
-    html = ARTIFACTS_PAGE.format(
-        generated_at=a["generated_at"][:16].replace("T", " "),
-        robots=_esc_html(a["robots_txt"]),
-        llms=_esc_html(a["llms_txt"]),
-        jsonld=_esc_html(a["json_ld"]),
-    )
-    return HTMLResponse(html)
-
-
-def _esc_html(s):
-    return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
-
-
-ARTIFACTS_PAGE = """
-<!DOCTYPE html><html lang="ko"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>GEO 산출물</title>
-<style>
-@import url('https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.css');
-:root{{--bg:#FAFAF9;--line:#E4E4E1;--ink:#14161A;--dim:#5B5F66;--dim2:#9A9DA3;--accent:#1E5E46}}
-*{{box-sizing:border-box}}
-body{{margin:0;background:var(--bg);color:var(--ink);font-family:'Pretendard',-apple-system,sans-serif;
-  font-size:14px;line-height:1.6}}
-.app{{max-width:1080px;margin:0 auto;padding:40px 24px 64px}}
-.topbar{{padding:0 0 24px;border-bottom:1px solid var(--line);margin-bottom:32px}}
-h1{{font-size:18px;font-weight:500;margin:0}}
-.sub{{font-size:12.5px;color:var(--dim);margin-top:4px}}
-.card{{border:1px solid var(--line);border-radius:2px;padding:24px;margin-top:20px}}
-.card-h{{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px}}
-.card-h h2{{font-size:15px;font-weight:500;margin:0}}
-button.copy{{border:1px solid var(--ink);background:transparent;color:var(--ink);
-  padding:6px 14px;font-size:12.5px;border-radius:2px;cursor:pointer;font-family:inherit}}
-button.copy:hover{{background:var(--ink);color:var(--bg)}}
-pre{{background:#F3F3F1;border:1px solid var(--line);border-radius:2px;padding:16px;
-  overflow-x:auto;font-size:12.5px;line-height:1.6;max-height:360px;overflow-y:auto;
-  font-family:ui-monospace,'SF Mono',Menlo,monospace;white-space:pre-wrap}}
-.note{{font-size:12px;color:var(--dim2);margin-top:12px;line-height:1.6}}
-</style></head><body>
-<div class="app">
-  <header class="topbar">
-    <h1>GEO 산출물</h1>
-    <div class="sub">생성 {generated_at} · robots.txt / llms.txt / JSON-LD</div>
-  </header>
-
-  <div class="card">
-    <div class="card-h"><h2>권장 robots.txt</h2><button class="copy" onclick="cp('robots')">복사</button></div>
-    <pre id="robots">{robots}</pre>
-    <div class="note">사이트 루트(/robots.txt)에 배포하면 GPTBot·ClaudeBot·PerplexityBot 등 AI 크롤러의 접근을 명시적으로 허용합니다.</div>
-  </div>
-
-  <div class="card">
-    <div class="card-h"><h2>생성된 llms.txt</h2><button class="copy" onclick="cp('llms')">복사</button></div>
-    <pre id="llms">{llms}</pre>
-    <div class="note">사이트 루트(/llms.txt)에 배포하면 LLM이 사이트를 빠르게 요약 이해하는 데 참고합니다.</div>
-  </div>
-
-  <div class="card">
-    <div class="card-h"><h2>생성된 JSON-LD</h2><button class="copy" onclick="cp('jsonld')">복사</button></div>
-    <pre id="jsonld">{jsonld}</pre>
-    <div class="note">페이지 &lt;head&gt;에 &lt;script type="application/ld+json"&gt;...&lt;/script&gt;로 감싸 삽입하세요.</div>
-  </div>
-</div>
-<script>
-function cp(id) {{
-  const text = document.getElementById(id).innerText;
-  navigator.clipboard.writeText(text);
-  event.target.innerText = "복사됨";
-  setTimeout(() => event.target.innerText = "복사", 1200);
-}}
-</script>
-</body></html>
-"""
-
+# ---------------- URL 즉석분석 ----------------
 
 @app.get("/", response_class=HTMLResponse)
 def analyze_shell(request: Request):
@@ -377,6 +98,13 @@ def analyze_shell(request: Request):
 
 @app.get("/analyze")
 def analyze_legacy_redirect():
+    return RedirectResponse("/", status_code=301)
+
+
+@app.get("/monitor")
+@app.get("/ads")
+@app.get("/artifacts")
+def removed_feature_redirect():
     return RedirectResponse("/", status_code=301)
 
 
@@ -391,7 +119,6 @@ def analyze_content(request: Request, url: str = ""):
 
     import requests as _rq
     from collectors.onpage import USER_AGENT, TIMEOUT
-    from collectors.tech_audit import audit_technical
 
     target = url.strip()
     if not target.startswith("http"):
@@ -406,13 +133,13 @@ def analyze_content(request: Request, url: str = ""):
         ).replace("{prev_url}", target))
 
     scores = score_categories(tech)
-
-    from collectors.pagespeed import collect_pagespeed
     psi = collect_pagespeed(target, api_key=config.PAGESPEED_API_KEY or None)
-
     rx = prescribe(tech=tech)
-    artifacts = generate_all(tech, brand_name=config.BRAND_NAME or None,
-                              social_urls=config.SOCIAL_URLS or None)
+
+    # 브랜드명은 매번 크롤링한 이 URL의 실제 정보에서만 뽑는다 — 관리자가 설정한
+    # 고정 브랜드명을 쓰면 다른 사이트를 분석할 때 엉뚱한 이름이 섞여 들어간다.
+    brand_name = guess_brand_name(tech) or target
+    artifacts = generate_all(tech, brand_name=brand_name or None, social_urls=None)
 
     # 점수 카드 HTML
     score_cards = ""
@@ -460,6 +187,7 @@ def analyze_content(request: Request, url: str = ""):
 
     # AI 노출(Gemini) — 크롤링한 사이트 정보로 질문을 자동 생성해서 실제로 Gemini에 물어봄.
     # mock 없음: 키가 없거나 실패하면 명확한 안내만 표시하고 가짜 점수는 절대 채우지 않는다.
+    # 경쟁사도 고정 목록을 쓰지 않는다 — 분석 대상이 매번 바뀌는데 고정 경쟁사를 대입하면 무의미하다.
     if not config.GEMINI_API_KEY:
         geo_section = """
         <div class="card">
@@ -471,9 +199,7 @@ def analyze_content(request: Request, url: str = ""):
             gen_prompts = generate_prompts(tech, config.GEMINI_API_KEY, config.GEMINI_MODEL, count=3)
             geo = run_geo_visibility(
                 gen_prompts, config.GEMINI_API_KEY, config.GEMINI_MODEL,
-                brand_name=config.BRAND_NAME or guess_brand_name(tech) or target,
-                brand_domain=target,
-                competitors=_build_competitors(),
+                brand_name=brand_name, brand_domain=target,
             )
             live = [r for r in geo["records"] if r["status"] == "LIVE"]
             total = len(live)
@@ -529,6 +255,10 @@ def analyze_content(request: Request, url: str = ""):
         jsonld=_esc_html(artifacts["json_ld"]),
     )
     return HTMLResponse(page)
+
+
+def _esc_html(s):
+    return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
 
 
 ANALYZE_FORM_TEMPLATE = """

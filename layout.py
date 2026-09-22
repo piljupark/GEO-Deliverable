@@ -1,6 +1,6 @@
 """
 사이드바 셸.
-render_gsc.py/render_ads.py가 이미 완결된 HTML 문서라, 그 CSS를 건드리지 않고
+분석 결과 페이지(ANALYZE_RESULT_PAGE 등)가 이미 완결된 HTML 문서라, 그 CSS를 건드리지 않고
 iframe으로 감싸는 방식으로 좌측 네비게이션 구조를 얹는다.
 """
 
@@ -14,11 +14,6 @@ def _esc(s):
 NAV_ITEMS = [
     ("진단", [
         ("URL 분석", "/", "analyze"),
-    ]),
-    ("내 사이트 모니터링", [
-        ("검색 성과", "/monitor", "dashboard"),
-        ("홈페이지 분석", "/artifacts", "artifacts"),
-        ("광고 리포트", "/ads", "ads"),
     ]),
     ("설정", [
         ("로그아웃", "/logout", "logout"),
