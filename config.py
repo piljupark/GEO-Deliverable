@@ -55,7 +55,20 @@ BRAND_NAME = _env("BRAND_NAME", "")
 PAGESPEED_API_KEY = _env("PAGESPEED_API_KEY", "")
 SOCIAL_URLS = [u.strip() for u in _env("SOCIAL_URLS", "").split(",") if u.strip()]
 COMPETITOR_URLS = [u.strip() for u in _env("COMPETITOR_URLS", "").split(",") if u.strip()]
+# COMPETITOR_URLS와 같은 순서로 대응하는 경쟁사 "이름"(콤마 구분). 없으면 도메인에서 대충 유추.
+COMPETITOR_NAMES = [n.strip() for n in _env("COMPETITOR_NAMES", "").split(",") if n.strip()]
 TARGET_KEYWORDS = [k.strip() for k in _env("TARGET_KEYWORDS", "").split(",") if k.strip()]
+
+# ---- Gemini AI 노출 추적 (무료 티어) ----
+# console: aistudio.google.com/apikey 에서 무료로 발급 (신용카드 불필요)
+GEMINI_API_KEY = _env("GEMINI_API_KEY", "")
+GEMINI_MODEL = _env("GEMINI_MODEL", "gemini-2.5-flash")
+
+# 추적할 질문(프롬프트) 고정 목록. 실제 사용자가 물어볼 법한 자연어 질문을 직접 채워 넣는다.
+# 예: "기업교육 서비스 잘하는 곳 추천해줘"
+GEO_PROMPTS = [
+    p.strip() for p in _env("GEO_PROMPTS", "").split("\n") if p.strip()
+]
 
 # refresh 엔드포인트 보호용 (cron-job.org가 이 키를 같이 보내야 실행됨)
 REFRESH_TOKEN = _env("REFRESH_TOKEN", "")

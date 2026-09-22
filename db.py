@@ -32,6 +32,23 @@ def init_db():
             gsc_position REAL, serp_rank INTEGER,
             UNIQUE(keyword, date)
         )""")
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS geo_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT NOT NULL,           -- YYYY-MM-DD
+            platform TEXT NOT NULL,       -- 'gemini' (추후 다른 플랫폼 확장 대비)
+            prompt TEXT NOT NULL,
+            status TEXT NOT NULL,         -- 'LIVE' | 'ERROR:...'
+            mentioned INTEGER,            -- 0/1/NULL
+            cited INTEGER,                -- 0/1/NULL
+            cited_urls TEXT,              -- JSON
+            competitor_mentions TEXT,     -- JSON
+            competitor_citations TEXT,    -- JSON
+            answer_preview TEXT,
+            detail TEXT,
+            created_at TEXT NOT NULL,
+            UNIQUE(date, platform, prompt)
+        )""")
         c.commit()
 
 
@@ -82,3 +99,55 @@ def keyword_history(keyword):
             "SELECT * FROM keyword_history WHERE keyword=? ORDER BY date", (keyword,)
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+def save_geo_run(date, platform, prompt, status, mentioned, cited,
+                  cited_urls, competitor_mentions, competitor_citations,
+                  answer_preview, detail):
+    with _conn() as c:
+        c.execute("""
+        INSERT INTO geo_runs (date, platform, prompt, status, mentioned, cited,
+                               cited_urls, competitor_mentions, competitor_citations,
+                               answer_preview, detail, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(date, platform, prompt) DO UPDATE SET
+            status=excluded.status, mentioned=excluded.mentioned, cited=excluded.cited,
+            cited_urls=excluded.cited_urls, competitor_mentions=excluded.competitor_mentions,
+            competitor_citations=excluded.competitor_citations,
+            answer_preview=excluded.answer_preview, detail=excluded.detail,
+            created_at=excluded.created_at
+        """, (date, platform, prompt, status, mentioned, cited,
+              json.dumps(cited_urls, ensure_ascii=False),
+              json.dumps(competitor_mentions, ensure_ascii=False),
+              json.dumps(competitor_citations, ensure_ascii=False),
+              answer_preview, detail, datetime.now(timezone.utc).isoformat()))
+        c.commit()
+
+
+def geo_runs_on_date(date, platform="gemini"):
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT * FROM geo_runs WHERE date=? AND platform=? ORDER BY id", (date, platform)
+        ).fetchall()
+        return [_geo_row_to_dict(r) for r in rows]
+
+
+def geo_runs_history(platform="gemini", limit_days=30):
+    """최근 limit_days일치 기록을 날짜순으로 반환 (트렌드 차트용)."""
+    with _conn() as c:
+        rows = c.execute("""
+            SELECT * FROM geo_runs WHERE platform=?
+            AND date >= date('now', ?)
+            ORDER BY date
+        """, (platform, f"-{limit_days} days")).fetchall()
+        return [_geo_row_to_dict(r) for r in rows]
+
+
+def _geo_row_to_dict(row):
+    d = dict(row)
+    for key in ("cited_urls", "competitor_mentions", "competitor_citations"):
+        try:
+            d[key] = json.loads(d[key]) if d[key] else ({} if "urls" not in key else [])
+        except Exception:
+            d[key] = {} if "urls" not in key else []
+    return d

@@ -31,6 +31,7 @@ from collectors.prescribe import prescribe
 from collectors.serp import rank_keywords
 from collectors.competitor import compare_sites
 from collectors.tracker import growth_summary
+from collectors.geo_gemini import run_geo_visibility
 from generators.artifacts import generate_all
 from generators.scoring import score_categories, score_tier
 from layout import sidebar_shell
@@ -181,6 +182,173 @@ def ads_report(request: Request):
     return HTMLResponse(html)
 
 
+# ---------------- AI 노출 (Gemini) ----------------
+
+@app.get("/geo", response_class=HTMLResponse)
+def geo_shell(request: Request):
+    if not _require_login(request):
+        return RedirectResponse("/login", status_code=303)
+    return HTMLResponse(sidebar_shell("geo", "/_content/geo", title="AI 노출"))
+
+
+@app.get("/_content/geo", response_class=HTMLResponse)
+def geo_content(request: Request):
+    if not _require_login(request):
+        return RedirectResponse("/login", status_code=303)
+
+    if not config.GEMINI_API_KEY:
+        return HTMLResponse(
+            "<p style='font-family:sans-serif;padding:40px'>GEMINI_API_KEY가 설정되지 않았습니다. "
+            "aistudio.google.com/apikey 에서 무료로 발급 후 환경변수에 넣어주세요.</p>"
+        )
+    if not config.GEO_PROMPTS:
+        return HTMLResponse(
+            "<p style='font-family:sans-serif;padding:40px'>추적할 프롬프트가 없습니다. "
+            "config.py의 GEO_PROMPTS(또는 GEO_PROMPTS 환경변수, 줄바꿈으로 구분)를 채워주세요.</p>"
+        )
+
+    today = datetime.now(timezone.utc).date().isoformat()
+    today_runs = db.geo_runs_on_date(today, platform="gemini")
+    if not today_runs:
+        return HTMLResponse(
+            "<p style='font-family:sans-serif;padding:40px'>아직 오늘 실행된 기록이 없습니다. "
+            "<a href='/refresh?token=" + config.REFRESH_TOKEN + "'>지금 새로고침</a></p>"
+        )
+
+    history = db.geo_runs_history(platform="gemini", limit_days=30)
+
+    live_runs = [r for r in today_runs if r["status"] == "LIVE"]
+    error_runs = [r for r in today_runs if r["status"] != "LIVE"]
+    total = len(live_runs)
+    mentioned_count = sum(1 for r in live_runs if r["mentioned"])
+    cited_count = sum(1 for r in live_runs if r["cited"])
+    exposure_score = round(mentioned_count / total * 100) if total else None
+    citation_share = round(cited_count / total * 100) if total else None
+
+    # 경쟁사 언급 합계 (언급 점유율 도넛용)
+    comp_totals = {}
+    for r in live_runs:
+        for name, hit in (r["competitor_mentions"] or {}).items():
+            if hit:
+                comp_totals[name] = comp_totals.get(name, 0) + 1
+    brand_label = config.BRAND_NAME or "우리"
+    mention_totals = {brand_label: mentioned_count, **comp_totals}
+    mention_sum = sum(mention_totals.values()) or 1
+    mention_share_rows = "".join(
+        f'<div class="share-row"><span>{html.escape(name)}</span>'
+        f'<span>{round(cnt / mention_sum * 100)}% ({cnt})</span></div>'
+        for name, cnt in sorted(mention_totals.items(), key=lambda x: -x[1])
+    )
+
+    # 프롬프트별 상태 테이블
+    prompt_rows = ""
+    for r in today_runs:
+        if r["status"] != "LIVE":
+            status_html = f'<span class="tag tag-err">실패: {html.escape(r["detail"])}</span>'
+        else:
+            m = '<span class="tag tag-yes">언급됨</span>' if r["mentioned"] else '<span class="tag tag-no">언급 없음</span>'
+            c = '<span class="tag tag-yes">인용됨</span>' if r["cited"] else '<span class="tag tag-no">인용 없음</span>'
+            status_html = m + c
+        prompt_rows += f"""
+        <div class="prompt-row">
+          <div class="prompt-text">{html.escape(r['prompt'])}</div>
+          <div class="prompt-status">{status_html}</div>
+        </div>"""
+
+    # 노출도 점수 추이 (일자별 mentioned 비율)
+    by_date = {}
+    for r in history:
+        by_date.setdefault(r["date"], []).append(r)
+    trend_rows = ""
+    for d in sorted(by_date.keys()):
+        rows_d = [r for r in by_date[d] if r["status"] == "LIVE"]
+        if not rows_d:
+            continue
+        pct = round(sum(1 for r in rows_d if r["mentioned"]) / len(rows_d) * 100)
+        trend_rows += f'<div class="trend-bar"><div class="trend-fill" style="height:{pct}%"></div><div class="trend-label">{d[5:]}<br>{pct}%</div></div>'
+
+    page = GEO_PAGE.format(
+        exposure_score=exposure_score if exposure_score is not None else "—",
+        citation_share=citation_share if citation_share is not None else "—",
+        total=total,
+        error_count=len(error_runs),
+        mention_share_rows=mention_share_rows or '<div class="issue-empty">데이터 없음</div>',
+        prompt_rows=prompt_rows,
+        trend_rows=trend_rows or '<div class="issue-empty">추이 데이터가 아직 부족합니다.</div>',
+    )
+    return HTMLResponse(page)
+
+
+GEO_PAGE = """
+<!DOCTYPE html><html lang="ko"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+@import url('https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.css');
+:root{{--bg:#FAFAF9;--line:#E4E4E1;--ink:#14161A;--dim:#5B5F66;--dim2:#9A9DA3;--accent:#1E5E46}}
+*{{box-sizing:border-box}}
+body{{margin:0;background:var(--bg);color:var(--ink);font-family:'Pretendard',sans-serif;
+  font-size:14px;line-height:1.6}}
+.app{{max-width:960px;margin:0 auto;padding:32px 24px 64px}}
+h1{{font-size:18px;font-weight:500;margin:0 0 4px}}
+.sub{{font-size:12.5px;color:var(--dim);margin-bottom:24px}}
+.scores{{display:grid;grid-template-columns:repeat(2,1fr);gap:12px;margin-bottom:24px}}
+.score-card{{border:1px solid var(--line);border-radius:2px;padding:18px}}
+.score-label{{font-size:12.5px;color:var(--dim)}}
+.score-num{{font-size:28px;font-weight:500;margin:8px 0 4px}}
+.score-num span{{font-size:14px;color:var(--dim2);font-weight:400}}
+.card{{border:1px solid var(--line);border-radius:2px;padding:24px;margin-top:16px}}
+.card h2{{font-size:15px;font-weight:500;margin:0 0 14px}}
+.share-row{{display:flex;justify-content:space-between;padding:8px 0;border-top:1px solid #ECECE9;font-size:13px}}
+.share-row:first-child{{border-top:none}}
+.prompt-row{{display:flex;justify-content:space-between;align-items:center;gap:12px;
+  padding:12px 0;border-top:1px solid #ECECE9}}
+.prompt-row:first-child{{border-top:none}}
+.prompt-text{{font-size:13.5px;flex:1}}
+.prompt-status{{display:flex;gap:6px;flex:0 0 auto}}
+.tag{{font-size:11px;padding:3px 8px;border-radius:10px;white-space:nowrap}}
+.tag-yes{{background:#E6F4EC;color:#1E5E46}}
+.tag-no{{background:#F0F0EE;color:var(--dim)}}
+.tag-err{{background:#FBE9E7;color:#c5221f}}
+.issue-empty{{color:var(--dim2);font-size:13px}}
+.trend-wrap{{display:flex;gap:6px;align-items:flex-end;height:120px;overflow-x:auto}}
+.trend-bar{{flex:0 0 32px;height:100%;display:flex;flex-direction:column;justify-content:flex-end;align-items:center}}
+.trend-fill{{width:16px;background:var(--accent);border-radius:2px 2px 0 0;min-height:2px}}
+.trend-label{{font-size:9px;color:var(--dim2);margin-top:4px;text-align:center;line-height:1.3}}
+</style></head><body>
+<div class="app">
+  <h1>AI 노출 (Gemini)</h1>
+  <div class="sub">오늘 실행 {total}건 · 실패 {error_count}건 · Google Search grounding 기반 실데이터</div>
+
+  <div class="scores">
+    <div class="score-card">
+      <div class="score-label">노출도 점수</div>
+      <div class="score-num">{exposure_score}<span>/100</span></div>
+    </div>
+    <div class="score-card">
+      <div class="score-label">인용 점유율</div>
+      <div class="score-num">{citation_share}<span>/100</span></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>노출도 점수 추이 (최근 30일)</h2>
+    <div class="trend-wrap">{trend_rows}</div>
+  </div>
+
+  <div class="card">
+    <h2>언급 점유율</h2>
+    {mention_share_rows}
+  </div>
+
+  <div class="card">
+    <h2>프롬프트별 결과</h2>
+    {prompt_rows}
+  </div>
+</div>
+</body></html>
+"""
+
+
 # ---------------- 새로고침 (cron-job.org가 호출) ----------------
 
 @app.get("/refresh", response_class=PlainTextResponse)
@@ -256,7 +424,48 @@ def refresh(token: str = ""):
     db.save_snapshot("naver", naver)
     log.append(f"네이버: {naver['source']}")
 
+    # 7) Gemini AI 노출 추적 (무료 티어) — 고정 프롬프트를 실제로 Gemini에 질의, mock 없음
+    if not config.GEMINI_API_KEY:
+        log.append("Gemini AI 노출: GEMINI_API_KEY 없음, 건너뜀")
+    elif not config.GEO_PROMPTS:
+        log.append("Gemini AI 노출: GEO_PROMPTS 없음, 건너뜀")
+    else:
+        try:
+            geo = run_geo_visibility(
+                config.GEO_PROMPTS, config.GEMINI_API_KEY, config.GEMINI_MODEL,
+                brand_name=config.BRAND_NAME or config.MY_URL,
+                brand_domain=config.MY_URL,
+                competitors=_build_competitors(),
+            )
+            today = datetime.now(timezone.utc).date().isoformat()
+            ok = 0
+            for r in geo["records"]:
+                db.save_geo_run(
+                    today, "gemini", r["prompt"], r["status"],
+                    r["mentioned"], r["cited"], r["cited_urls"],
+                    r["competitor_mentions"], r["competitor_citations"],
+                    r["answer_preview"], r["detail"],
+                )
+                if r["status"] == "LIVE":
+                    ok += 1
+            log.append(f"Gemini AI 노출: {ok}/{len(geo['records'])}개 성공")
+        except Exception as e:
+            log.append(f"Gemini AI 노출 실패: {e}")
+
     return PlainTextResponse("\n".join(log))
+
+
+def _build_competitors():
+    """COMPETITOR_URLS와 COMPETITOR_NAMES를 순서대로 짝지어 {name, domain} 리스트로."""
+    from urllib.parse import urlparse
+    out = []
+    for i, url in enumerate(config.COMPETITOR_URLS):
+        if i < len(config.COMPETITOR_NAMES):
+            name = config.COMPETITOR_NAMES[i]
+        else:
+            name = (urlparse(url).netloc or url).split(".")[0]
+        out.append({"name": name, "domain": url})
+    return out
 
 
 @app.get("/artifacts", response_class=HTMLResponse)
