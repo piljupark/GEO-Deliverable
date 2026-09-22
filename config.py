@@ -28,4 +28,4 @@ PAGESPEED_API_KEY = _env("PAGESPEED_API_KEY", "")
 # console: aistudio.google.com/apikey 에서 무료로 발급 (신용카드 불필요)
 # /analyze에 입력된 URL을 크롤링한 정보를 바탕으로 질문을 자동 생성해서 즉석으로 확인한다.
 GEMINI_API_KEY = _env("GEMINI_API_KEY", "")
-GEMINI_MODEL = _env("GEMINI_MODEL", "gemini-2.0-flash")
+GEMINI_MODEL = _env("GEMINI_MODEL", "gemini-2.5-flash")
