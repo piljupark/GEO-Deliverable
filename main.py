@@ -26,6 +26,7 @@ from collectors.tech_audit import audit_technical
 from collectors.prescribe import prescribe
 from collectors.pagespeed import collect_pagespeed
 from collectors.geo_gemini import generate_prompts, run_geo_visibility, guess_brand_name
+from collectors.geo_status import check_current_geo_status
 from generators.artifacts import generate_all
 from generators.scoring import score_categories, score_tier
 from layout import sidebar_shell
@@ -141,6 +142,10 @@ def analyze_content(request: Request, url: str = ""):
     brand_name = guess_brand_name(tech) or target
     artifacts = generate_all(tech, brand_name=brand_name or None, social_urls=None)
 
+    # 지금 이 사이트에 실제로 뭐가 있는지(robots.txt/llms.txt/sitemap.xml/JSON-LD) 확인.
+    # 아래 artifacts는 우리가 만든 "권장안"이고, 이건 그 반대 — 실제 현황.
+    geo_status = check_current_geo_status(target, r.text)
+
     # 점수 카드 HTML
     score_cards = ""
     for key, s in scores.items():
@@ -184,6 +189,63 @@ def analyze_content(request: Request, url: str = ""):
         </div>"""
     if not issue_rows:
         issue_rows = '<div class="issue-empty">발견된 이슈가 없습니다.</div>'
+
+    # 현재 GEO 상태 — robots.txt/llms.txt/sitemap.xml/JSON-LD가 실제로 있는지, AI 크롤러를
+    # 막고 있진 않은지 있는 그대로 확인해서 "잘된 점"/"개선점"으로 정리한다.
+    good_points, improve_points = [], []
+
+    rb = geo_status["robots"]
+    if rb["exists"] is None:
+        improve_points.append(f"robots.txt 확인 실패: {html.escape(rb.get('error', ''))}")
+    elif not rb["exists"]:
+        improve_points.append("robots.txt가 없습니다 — AI 크롤러 접근 정책을 명시할 수 없는 상태입니다.")
+    else:
+        blocked = [b for b in rb["bots"] if not b["allowed"]]
+        if not blocked:
+            good_points.append("robots.txt가 있고 주요 AI 크롤러(GPTBot·ClaudeBot·PerplexityBot 등)를 모두 허용하고 있습니다.")
+        else:
+            names = ", ".join(b["bot"] for b in blocked[:4]) + ("…" if len(blocked) > 4 else "")
+            improve_points.append(f"robots.txt에서 AI 크롤러 {len(blocked)}개가 차단되어 있습니다 ({names}).")
+
+    lm = geo_status["llms"]
+    if lm["exists"] is None:
+        improve_points.append(f"llms.txt 확인 실패: {html.escape(lm.get('error', ''))}")
+    elif lm["exists"]:
+        good_points.append("llms.txt가 이미 있습니다.")
+    else:
+        improve_points.append("llms.txt가 없습니다 — AI가 사이트를 빠르게 이해하도록 돕는 파일입니다.")
+
+    sm = geo_status["sitemap"]
+    if sm["exists"] is None:
+        improve_points.append(f"sitemap.xml 확인 실패: {html.escape(sm.get('error', ''))}")
+    elif sm["exists"]:
+        cnt = sm["url_count"]
+        if sm["is_index"]:
+            good_points.append(f"sitemap.xml이 있습니다 (하위 사이트맵 {cnt}개를 포함한 인덱스 파일).")
+        else:
+            good_points.append(f"sitemap.xml이 있고 {cnt if cnt is not None else '여러'}개의 URL을 포함합니다.")
+    else:
+        improve_points.append("sitemap.xml이 없습니다.")
+
+    jl = geo_status["jsonld"]
+    valid_jl = [b for b in jl if b["valid"]]
+    if valid_jl:
+        all_types = sorted({t for b in valid_jl for t in b["types"]})
+        good_points.append(f"페이지에 JSON-LD 구조화 데이터가 이미 있습니다 (타입: {', '.join(all_types) or '미상'}).")
+    else:
+        improve_points.append("페이지에 JSON-LD 구조화 데이터가 없습니다.")
+    if any(not b["valid"] for b in jl):
+        improve_points.append("JSON-LD 블록 중 문법 오류로 파싱되지 않는 것이 있습니다.")
+
+    good_rows = "".join(f'<div class="issue-row"><span class="tag tag-yes">양호</span><div class="issue-title">{html.escape(p)}</div></div>' for p in good_points)
+    improve_rows = "".join(f'<div class="issue-row"><span class="tag tag-no">보완</span><div class="issue-title">{html.escape(p)}</div></div>' for p in improve_points)
+    geo_status_section = f"""
+    <div class="card">
+      <h2>현재 GEO 상태 (실제 확인)</h2>
+      <div class="sub-inline">robots.txt·llms.txt·sitemap.xml·JSON-LD를 지금 이 사이트에서 직접 가져와 확인한 결과입니다.</div>
+      {good_rows}
+      {improve_rows}
+    </div>"""
 
     # AI 노출(Gemini) — 크롤링한 사이트 정보로 질문을 자동 생성해서 실제로 Gemini에 물어봄.
     # mock 없음: 키가 없거나 실패하면 명확한 안내만 표시하고 가짜 점수는 절대 채우지 않는다.
@@ -249,6 +311,7 @@ def analyze_content(request: Request, url: str = ""):
         url=html.escape(target),
         score_cards=score_cards,
         issue_rows=issue_rows,
+        geo_status_section=geo_status_section,
         geo_section=geo_section,
         robots=_esc_html(artifacts["robots_txt"]),
         llms=_esc_html(artifacts["llms_txt"]),
@@ -289,7 +352,7 @@ button:disabled{opacity:.6;cursor:default}
   {error}
   <input name="url" placeholder="https://example.com" value="{prev_url}" autofocus>
   <button type="submit">분석하기</button>
-  <div class="wait-note">사이트 크롤링·웹 성능·AI 노출 확인을 순서대로 진행합니다. 최대 1~2분 정도 걸릴 수 있어요.</div>
+  <div class="wait-note">사이트 크롤링·현재 GEO 상태·웹 성능·AI 노출 확인을 순서대로 진행합니다. 최대 1~2분 정도 걸릴 수 있어요.</div>
 </form>
 </body></html>
 """
@@ -351,17 +414,18 @@ pre{{background:#F3F3F1;border:1px solid var(--line);border-radius:2px;padding:1
     <h2>발견된 이슈</h2>
     {issue_rows}
   </div>
+  {geo_status_section}
   {geo_section}
   <div class="card">
-    <div class="card-h"><h2>robots.txt</h2><button class="copy" onclick="cp('r')">복사</button></div>
+    <div class="card-h"><h2>권장 robots.txt</h2><button class="copy" onclick="cp('r')">복사</button></div>
     <pre id="r">{robots}</pre>
   </div>
   <div class="card">
-    <div class="card-h"><h2>llms.txt</h2><button class="copy" onclick="cp('l')">복사</button></div>
+    <div class="card-h"><h2>권장 llms.txt</h2><button class="copy" onclick="cp('l')">복사</button></div>
     <pre id="l">{llms}</pre>
   </div>
   <div class="card">
-    <div class="card-h"><h2>JSON-LD</h2><button class="copy" onclick="cp('j')">복사</button></div>
+    <div class="card-h"><h2>권장 JSON-LD</h2><button class="copy" onclick="cp('j')">복사</button></div>
     <pre id="j">{jsonld}</pre>
   </div>
 </div>
