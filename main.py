@@ -419,48 +419,56 @@ def analyze_content(request: Request, url: str = "", competitors: str = ""):
                   {page_rows}
                 </div>"""
 
-            geo_rows = ""
-            for r in geo["records"]:
-                if r["status"] != "LIVE":
-                    status_html = f'<span class="tag tag-err">실패: {html.escape(r["detail"])}</span>'
+            if quota_banner:
+                # 전부 429면 "—" 투성이 점수·비교·프롬프트 목록을 늘어놔봐야 정보가 없다.
+                # 배너 하나로 끝낸다.
+                geo_section = f"""
+                <div class="card">
+                  <h2>AI 노출 (Gemini)</h2>
+                  {quota_banner}
+                </div>"""
+            else:
+                geo_rows = ""
+                for r in geo["records"]:
+                    if r["status"] != "LIVE":
+                        status_html = f'<span class="tag tag-err">실패: {html.escape(r["detail"])}</span>'
+                        geo_rows += f"""
+                        <div class="prompt-row">
+                          <div class="prompt-text">{html.escape(r['prompt'])}</div>
+                          <div class="prompt-status">{status_html}</div>
+                        </div>"""
+                        continue
+                    m = '<span class="tag tag-yes">언급됨</span>' if r["mentioned"] else '<span class="tag tag-no">언급 없음</span>'
+                    c = '<span class="tag tag-yes">인용됨</span>' if r["cited"] else '<span class="tag tag-no">인용 없음</span>'
+                    sites_html = f'<div class="prompt-site"><span class="site-label">자사</span>{m}{c}</div>'
+                    for comp in competitors_for_gemini:
+                        name = comp["name"]
+                        cm = '<span class="tag tag-yes">언급됨</span>' if r["competitor_mentions"].get(name) else '<span class="tag tag-no">언급 없음</span>'
+                        cc2 = '<span class="tag tag-yes">인용됨</span>' if r["competitor_citations"].get(name) else '<span class="tag tag-no">인용 없음</span>'
+                        sites_html += f'<div class="prompt-site"><span class="site-label">{html.escape(name)}</span>{cm}{cc2}</div>'
                     geo_rows += f"""
                     <div class="prompt-row">
                       <div class="prompt-text">{html.escape(r['prompt'])}</div>
-                      <div class="prompt-status">{status_html}</div>
+                      <div class="prompt-sites">{sites_html}</div>
                     </div>"""
-                    continue
-                m = '<span class="tag tag-yes">언급됨</span>' if r["mentioned"] else '<span class="tag tag-no">언급 없음</span>'
-                c = '<span class="tag tag-yes">인용됨</span>' if r["cited"] else '<span class="tag tag-no">인용 없음</span>'
-                sites_html = f'<div class="prompt-site"><span class="site-label">자사</span>{m}{c}</div>'
-                for comp in competitors_for_gemini:
-                    name = comp["name"]
-                    cm = '<span class="tag tag-yes">언급됨</span>' if r["competitor_mentions"].get(name) else '<span class="tag tag-no">언급 없음</span>'
-                    cc2 = '<span class="tag tag-yes">인용됨</span>' if r["competitor_citations"].get(name) else '<span class="tag tag-no">인용 없음</span>'
-                    sites_html += f'<div class="prompt-site"><span class="site-label">{html.escape(name)}</span>{cm}{cc2}</div>'
-                geo_rows += f"""
-                <div class="prompt-row">
-                  <div class="prompt-text">{html.escape(r['prompt'])}</div>
-                  <div class="prompt-sites">{sites_html}</div>
-                </div>"""
 
-            geo_section = f"""
-            <div class="card">
-              <h2>AI 노출 (Gemini)</h2>
-              <div class="sub-inline">자동 생성된 질문 {len(geo['records'])}개 중 {total}개 성공 · Google Search grounding 기반 실데이터</div>
-              {quota_banner}
-              <div class="scores" style="margin:14px 0 18px;grid-template-columns:repeat(2,1fr)">
-                <div class="score-card">
-                  <div class="score-label">노출도 점수</div>
-                  <div class="score-num">{exposure_score if exposure_score is not None else "—"}<span>/100</span></div>
-                </div>
-                <div class="score-card">
-                  <div class="score-label">인용 점유율</div>
-                  <div class="score-num">{citation_share if citation_share is not None else "—"}<span>/100</span></div>
-                </div>
-              </div>
-              {comparison_rows}
-              {geo_rows}
-            </div>"""
+                geo_section = f"""
+                <div class="card">
+                  <h2>AI 노출 (Gemini)</h2>
+                  <div class="sub-inline">자동 생성된 질문 {len(geo['records'])}개 중 {total}개 성공 · Google Search grounding 기반 실데이터</div>
+                  <div class="scores" style="margin:14px 0 18px;grid-template-columns:repeat(2,1fr)">
+                    <div class="score-card">
+                      <div class="score-label">노출도 점수</div>
+                      <div class="score-num">{exposure_score if exposure_score is not None else "—"}<span>/100</span></div>
+                    </div>
+                    <div class="score-card">
+                      <div class="score-label">인용 점유율</div>
+                      <div class="score-num">{citation_share if citation_share is not None else "—"}<span>/100</span></div>
+                    </div>
+                  </div>
+                  {comparison_rows}
+                  {geo_rows}
+                </div>"""
         except Exception as e:
             if "429" in str(e):
                 msg = "Gemini 무료 쿼터를 초과했습니다 — 분당 한도면 1분 후, 일일 한도면 하루 지나야 복구됩니다."
