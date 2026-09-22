@@ -511,7 +511,7 @@ def _serp_panel(serp, my_domain):
           <div class="card-h"><h2>키워드별 실제 순위 (SERP)</h2></div>
           <div class="banner" style="margin:0">
             <strong>SerpApi 키가 설정되지 않았습니다.</strong>
-            config_gsc.py의 SERPAPI_KEY를 설정하면 이 키워드들의 실제 구글 검색결과 순위와
+            Render 환경변수의 SERPAPI_KEY를 설정하면 이 키워드들의 실제 구글 검색결과 순위와
             경쟁사 도메인이 표시됩니다. (월 250회 무료)
           </div>
         </section>"""

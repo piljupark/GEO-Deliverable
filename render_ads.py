@@ -129,7 +129,8 @@ def render_ads_report(ga4, naver, out_path, google_ads=None, meta_ads=None,
             parts.append("네이버 검색광고")
         mock_banner = f"""
         <div class="banner"><strong>데모 데이터</strong> — {', '.join(parts)}가 아직 실데이터에
-        연결되지 않았습니다. config_ads.py에 인증을 채우면 실데이터로 바뀝니다.</div>"""
+        연결되지 않았습니다. Render 환경변수에 인증 정보를 채우면 실데이터로 바뀝니다
+        (자세한 방법은 DEPLOY.md 참고).</div>"""
 
     ad_rows = (
         _ad_row("google / searchad", google_ads, pending=not google_enabled) +
@@ -193,7 +194,7 @@ def render_ads_report(ga4, naver, out_path, google_ads=None, meta_ads=None,
       <tbody>{ad_rows}</tbody>
     </table>
     <div class="card-note">Google Ads·Meta는 API 승인 전까지 자동 집계에서 제외됩니다.
-    승인 완료 시 config_ads.py에 인증 정보를 넣으면 자동으로 채워집니다.</div>
+    승인 완료 시 Render 환경변수에 인증 정보를 넣으면 자동으로 채워집니다.</div>
   </section>
 
   {notes_html}

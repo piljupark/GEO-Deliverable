@@ -276,6 +276,13 @@ def _build_competitors():
 
 
 @app.get("/artifacts", response_class=HTMLResponse)
+def artifacts_shell(request: Request):
+    if not _require_login(request):
+        return RedirectResponse("/login", status_code=303)
+    return HTMLResponse(sidebar_shell("artifacts", "/_content/artifacts", title="홈페이지 분석"))
+
+
+@app.get("/_content/artifacts", response_class=HTMLResponse)
 def artifacts_page(request: Request):
     if not _require_login(request):
         return RedirectResponse("/login", status_code=303)
@@ -311,11 +318,9 @@ ARTIFACTS_PAGE = """
 body{{margin:0;background:var(--bg);color:var(--ink);font-family:'Pretendard',-apple-system,sans-serif;
   font-size:14px;line-height:1.6}}
 .app{{max-width:1080px;margin:0 auto;padding:40px 24px 64px}}
-.topbar{{display:flex;align-items:center;justify-content:space-between;padding:0 0 24px;
-  border-bottom:1px solid var(--line);margin-bottom:32px}}
+.topbar{{padding:0 0 24px;border-bottom:1px solid var(--line);margin-bottom:32px}}
 h1{{font-size:18px;font-weight:500;margin:0}}
 .sub{{font-size:12.5px;color:var(--dim);margin-top:4px}}
-nav a{{color:var(--dim);text-decoration:none;font-size:13px;margin-left:20px}}
 .card{{border:1px solid var(--line);border-radius:2px;padding:24px;margin-top:20px}}
 .card-h{{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px}}
 .card-h h2{{font-size:15px;font-weight:500;margin:0}}
@@ -329,8 +334,8 @@ pre{{background:#F3F3F1;border:1px solid var(--line);border-radius:2px;padding:1
 </style></head><body>
 <div class="app">
   <header class="topbar">
-    <div><h1>GEO 산출물</h1><div class="sub">생성 {generated_at} · robots.txt / llms.txt / JSON-LD</div></div>
-    <nav><a href="/">URL 분석</a><a href="/monitor">검색 성과</a><a href="/ads">광고 리포트</a><a href="/logout">로그아웃</a></nav>
+    <h1>GEO 산출물</h1>
+    <div class="sub">생성 {generated_at} · robots.txt / llms.txt / JSON-LD</div>
   </header>
 
   <div class="card">
