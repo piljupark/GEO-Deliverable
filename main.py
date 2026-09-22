@@ -380,6 +380,11 @@ def analyze_content(request: Request, url: str = ""):
         ).replace("{prev_url}", target))
 
     scores = score_categories(tech)
+
+    from collectors.pagespeed import collect_pagespeed
+    psi = collect_pagespeed(target, api_key=config.PAGESPEED_API_KEY or None,
+                             mock=config.PAGESPEED_MOCK or not config.PAGESPEED_API_KEY)
+
     rx = prescribe(tech=tech)
     artifacts = generate_all(tech, brand_name=config.BRAND_NAME or None,
                               social_urls=config.SOCIAL_URLS or None)
@@ -392,6 +397,25 @@ def analyze_content(request: Request, url: str = ""):
           <div class="score-label">{s['label']}</div>
           <div class="score-num">{s['score']}<span>/100</span></div>
           <div class="score-tier">{score_tier(s['score'])}</div>
+        </div>"""
+
+    # 웹 성능 카드 — PageSpeed Insights(Lighthouse) 실측값
+    if psi["performance"] is None:
+        score_cards += """
+        <div class="score-card">
+          <div class="score-label">웹 성능</div>
+          <div class="score-num">측정 실패</div>
+        </div>"""
+    else:
+        lcp = psi["lcp"] if psi["lcp"] is not None else "—"
+        cls = psi["cls"] if psi["cls"] is not None else "—"
+        tbt = psi["tbt"] if psi["tbt"] is not None else "—"
+        score_cards += f"""
+        <div class="score-card">
+          <div class="score-label">웹 성능</div>
+          <div class="score-num">{psi['performance']}<span>/100</span></div>
+          <div class="score-tier">{score_tier(psi['performance'])}</div>
+          <div class="score-detail">LCP {lcp} · CLS {cls} · TBT {tbt}</div>
         </div>"""
 
     # 이슈(처방) 리스트 HTML — prescribe()가 만든 기술 항목만
@@ -466,6 +490,7 @@ a.reanalyze{{font-size:12.5px;color:var(--ink);border-bottom:1px solid var(--lin
 .score-num{{font-size:28px;font-weight:500;margin:8px 0 4px}}
 .score-num span{{font-size:14px;color:var(--dim2);font-weight:400}}
 .score-tier{{font-size:12px;color:var(--dim2)}}
+.score-detail{{font-size:11px;color:var(--dim2);margin-top:6px}}
 .card{{border:1px solid var(--line);border-radius:2px;padding:24px;margin-top:16px}}
 .card h2{{font-size:15px;font-weight:500;margin:0 0 14px}}
 .issue-row{{display:flex;gap:12px;padding:12px 0;border-top:1px solid #ECECE9}}

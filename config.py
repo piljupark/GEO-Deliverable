@@ -52,6 +52,8 @@ SERPAPI_KEY = _env("SERPAPI_KEY", "")
 # ---- 내 사이트 / 경쟁사 (콤마로 구분해서 환경변수에 넣음) ----
 MY_URL = _env("MY_URL", "https://example.com")
 BRAND_NAME = _env("BRAND_NAME", "")
+PAGESPEED_API_KEY = _env("PAGESPEED_API_KEY", "")
+PAGESPEED_MOCK = _env("PAGESPEED_MOCK", "true").lower() == "true"
 SOCIAL_URLS = [u.strip() for u in _env("SOCIAL_URLS", "").split(",") if u.strip()]
 COMPETITOR_URLS = [u.strip() for u in _env("COMPETITOR_URLS", "").split(",") if u.strip()]
 TARGET_KEYWORDS = [k.strip() for k in _env("TARGET_KEYWORDS", "").split(",") if k.strip()]

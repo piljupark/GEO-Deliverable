@@ -38,6 +38,10 @@ services:
         sync: false
       - key: MY_URL
         sync: false
+      - key: PAGESPEED_API_KEY
+        sync: false
+      - key: PAGESPEED_MOCK
+        value: "true"
       - key: COMPETITOR_URLS
         sync: false
       - key: TARGET_KEYWORDS
