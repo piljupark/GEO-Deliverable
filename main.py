@@ -370,12 +370,19 @@ def _render_geo_and_citation(gen_prompts, gen_prompts_error, tech, brand_names, 
         citation_share = round(cited_count / total * 100) if total else None
 
         # 전부 429(쿼터 초과)로 실패한 경우, 개별 에러 대신 원인을 명확히 알려준다.
+        # 응답 본문에 quotaId가 찍혀있으면 분당/일일 한도 중 뭔지 실제로 구분할 수 있다.
         quota_banner = ""
         if not live and errored and all("429" in rec["detail"] for rec in errored):
-            quota_banner = """
+            combined_detail = " ".join(rec["detail"] for rec in errored)
+            if "PerDay" in combined_detail:
+                quota_msg = "Gemini 무료 쿼터의 <b>일일 한도</b>를 초과했습니다 — 내일(태평양시간 자정 기준) 복구됩니다."
+            elif "PerMinute" in combined_detail:
+                quota_msg = "Gemini 무료 쿼터의 <b>분당 한도</b>를 초과했습니다 — 1분 정도 후 다시 시도하면 됩니다."
+            else:
+                quota_msg = "Gemini 무료 쿼터를 초과했습니다 — 분당 한도면 1분 후, 일일 한도면 하루 지나야 복구됩니다."
+            quota_banner = f"""
             <div class="issue-empty" style="margin-bottom:14px">
-              Gemini 무료 쿼터를 초과했습니다 — 분당 한도면 1분 후, 일일 한도면 하루 지나야 복구됩니다.
-              오늘 반복 테스트를 많이 하셨다면 일일 한도일 가능성이 큽니다.
+              {quota_msg}
             </div>"""
 
         # 경쟁사별 노출도/인용 — 자사와 같은 질문 세트를 같은 응답에서 함께 판별한 것.

@@ -18,7 +18,13 @@ def request_with_retry(method, url, attempts=3, backoff=2, **kwargs):
                 raise requests.exceptions.HTTPError(
                     f"{resp.status_code} Server Error: {resp.reason} for url: {url}", response=resp
                 )
-            resp.raise_for_status()
+            if resp.status_code >= 400:
+                # 본문(에러 사유·쿼터 종류 등)을 메시지에 붙여야 "분당 한도인지 일일
+                # 한도인지" 같은 걸 실제로 판별할 수 있다 — reason만으론 알 수 없다.
+                raise requests.exceptions.HTTPError(
+                    f"{resp.status_code} Client Error: {resp.reason} for url: {url} — {resp.text[:500]}",
+                    response=resp,
+                )
             return resp
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
             last_exc = e
