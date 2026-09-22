@@ -311,6 +311,7 @@ def analyze_content(request: Request, url: str = "", competitors: str = ""):
     # AI 노출(Gemini) — 크롤링한 사이트 정보로 질문을 자동 생성해서 실제로 Gemini에 물어봄.
     # mock 없음: 키가 없거나 실패하면 명확한 안내만 표시하고 가짜 점수는 절대 채우지 않는다.
     # 경쟁사도 고정 목록을 쓰지 않는다 — 분석 대상이 매번 바뀌는데 고정 경쟁사를 대입하면 무의미하다.
+    citation_detail_section = ""
     if not config.GEMINI_API_KEY:
         geo_section = """
         <div class="card">
@@ -361,6 +362,62 @@ def analyze_content(request: Request, url: str = "", competitors: str = ""):
                     comparison_rows += f"""
                     <div class="share-row"><span>{html.escape(name)}</span>
                       <span>노출 {ce if ce is not None else "—"}% · 인용 {cs if cs is not None else "—"}%</span></div>"""
+
+            # 인용 상세 — 실제로 인용된 URL을 도메인 기준 자사/경쟁사/제3자로 분류, 페이지별 순위화.
+            from collections import Counter
+            from urllib.parse import urlparse as _urlparse
+
+            def _cite_domain(u):
+                return (_urlparse(u).netloc or u).lower().lstrip("www.")
+
+            target_domain = _cite_domain(target)
+            competitor_domains = {_cite_domain(c["domain"]) for c in competitors_for_gemini}
+            all_cited = [u for r in live for u in r["cited_urls"]]
+            page_counts = Counter(all_cited)
+
+            def _classify_source(u):
+                d = _cite_domain(u)
+                if d == target_domain:
+                    return "자사"
+                if d in competitor_domains:
+                    return "경쟁사"
+                return "제3자"
+
+            source_counts = Counter(_classify_source(u) for u in all_cited)
+            total_cites = sum(source_counts.values())
+
+            citation_detail_section = ""
+            if all_cited:
+                cats = [("자사", "#2a78d6"), ("경쟁사", "#eb6834"), ("제3자", "#1baf7a")]
+                segs, legend = "", ""
+                for label, color in cats:
+                    cnt = source_counts.get(label, 0)
+                    if not cnt:
+                        continue
+                    pct = round(cnt / total_cites * 100)
+                    segs += f'<div style="flex:{cnt} 0 0;background:{color}"></div>'
+                    legend += f'<div class="legend-item"><span class="legend-swatch" style="background:{color}"></span>{label} {cnt}건 ({pct}%)</div>'
+
+                page_rows = ""
+                for u, cnt in page_counts.most_common(5):
+                    src = _classify_source(u)
+                    badge_cls = "tag-yes" if src == "자사" else "tag-no"
+                    page_rows += f"""
+                    <div class="cite-row">
+                      <a href="{html.escape(u)}" target="_blank" rel="noopener" class="cite-url">{html.escape(u)}</a>
+                      <span class="tag {badge_cls}">{src}</span>
+                      <span class="cite-count">{cnt}회</span>
+                    </div>"""
+
+                citation_detail_section = f"""
+                <div class="card">
+                  <h2>인용 상세</h2>
+                  <div class="sub-inline">Gemini 응답에서 실제로 인용된 출처 {total_cites}건 기준</div>
+                  <div class="stack-bar">{segs}</div>
+                  <div class="legend-row">{legend}</div>
+                  <div class="cite-list-title">가장 많이 인용된 페이지</div>
+                  {page_rows}
+                </div>"""
 
             geo_rows = ""
             for r in geo["records"]:
@@ -422,6 +479,7 @@ def analyze_content(request: Request, url: str = "", competitors: str = ""):
         geo_status_section=geo_status_section,
         competitor_score_section=competitor_score_section,
         geo_section=geo_section,
+        citation_detail_section=citation_detail_section,
         robots=_esc_html(artifacts["robots_txt"]),
         llms=_esc_html(artifacts["llms_txt"]),
         jsonld=_esc_html(artifacts["json_ld"]),
@@ -531,6 +589,17 @@ a.reanalyze{{font-size:12.5px;color:var(--ink);border-bottom:1px solid var(--lin
 .prompt-sites{{display:flex;flex-direction:column;gap:5px;align-items:flex-end;flex:0 0 auto}}
 .prompt-site{{display:flex;align-items:center;gap:6px;font-size:11px}}
 .site-label{{color:var(--dim2);min-width:60px;text-align:right}}
+.stack-bar{{display:flex;height:26px;border-radius:4px;overflow:hidden;gap:2px;background:#ECECE9;margin-top:6px}}
+.legend-row{{display:flex;flex-wrap:wrap;gap:14px;margin-top:10px}}
+.legend-item{{display:flex;align-items:center;gap:6px;font-size:12.5px;color:var(--dim)}}
+.legend-swatch{{width:10px;height:10px;border-radius:2px;flex:0 0 auto}}
+.cite-list-title{{font-size:12.5px;font-weight:500;color:var(--dim);margin:18px 0 6px}}
+.cite-row{{display:flex;align-items:center;gap:10px;padding:9px 0;border-top:1px solid #ECECE9}}
+.cite-row:first-child{{border-top:none}}
+.cite-url{{flex:1;font-size:12.5px;color:var(--ink);text-decoration:none;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}}
+.cite-url:hover{{text-decoration:underline}}
+.cite-count{{font-size:12px;color:var(--dim2);flex:0 0 auto}}
 .card-h{{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}}
 button.copy{{border:1px solid var(--ink);background:transparent;color:var(--ink);
   padding:5px 12px;font-size:12px;border-radius:2px;cursor:pointer}}
@@ -551,6 +620,7 @@ pre{{background:#F3F3F1;border:1px solid var(--line);border-radius:2px;padding:1
   {geo_status_section}
   {competitor_score_section}
   {geo_section}
+  {citation_detail_section}
   <div class="card">
     <div class="card-h"><h2>권장 robots.txt</h2><button class="copy" onclick="cp('r')">복사</button></div>
     <pre id="r">{robots}</pre>
