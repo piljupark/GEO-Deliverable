@@ -115,6 +115,25 @@ create table if not exists geo_prompts (
   archived boolean not null default false,
   created_at timestamptz not null default now()
 );
+
+-- geo_history가 하루치 요약 숫자 3개만 남기는 것과 달리, 이건 실행할 때마다 프롬프트별
+-- 원본 결과를 한 행씩 그대로 쌓아둔다. 나중에 프롬프트별 이력이나 "경쟁사는 인용됐는데
+-- 우리는 안 된 페이지" 같은 걸 만들려면 이 원본이 있어야 한다.
+create table if not exists geo_prompt_runs (
+  id bigserial primary key,
+  domain text not null,
+  date date not null,
+  prompt text not null,
+  topic text,
+  status text not null,
+  mentioned boolean,
+  cited boolean,
+  cited_urls jsonb not null default '[]',
+  competitor_mentions jsonb not null default '{}',
+  competitor_citations jsonb not null default '{}',
+  created_at timestamptz not null default now()
+);
+create index if not exists geo_prompt_runs_domain_date_idx on geo_prompt_runs (domain, date);
 ```
 
 ---

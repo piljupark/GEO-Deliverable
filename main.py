@@ -36,7 +36,7 @@ from collectors.prescribe import prescribe
 from collectors.pagespeed import collect_pagespeed
 from collectors.geo_gemini import generate_prompts, run_geo_visibility, guess_brand_name
 from collectors.geo_status import check_current_geo_status
-from collectors.history_store import save_snapshot, get_history
+from collectors.history_store import save_snapshot, save_prompt_runs, get_history
 from generators.artifacts import generate_all
 from generators.scoring import score_categories, score_tier
 from layout import sidebar_shell
@@ -340,11 +340,12 @@ def _render_trend_section(history):
 
 
 def _render_geo_and_citation(gen_prompts, gen_prompts_error, tech, brand_names, brand_domains, target,
-                              extra_competitors, prompts_source="generated"):
+                              extra_competitors, prompts_source="generated", prompt_topics=None):
     """AI 노출(Gemini) + 인용 상세 카드를 만든다. 실패하면 가짜 점수 대신 명확한 에러만 표시.
     brand_names/brand_domains: 등록된 브랜드 별칭·사이트 URL을 전부 포함한 리스트 (guess한 이름/분석 대상
     URL이 항상 0번째). extra_competitors: 설정에 저장된 경쟁사 목록 — 직접 크롤링하지 않고
-    Gemini 노출·인용 판별에만 쓴다.
+    Gemini 노출·인용 판별에만 쓴다. prompt_topics: {프롬프트 텍스트: 주제} — 저장된 프롬프트를
+    쓴 경우에만 채워지며, 프롬프트별 원본 이력 적재 시 주제를 같이 남기는 데 쓴다.
     반환값: (geo_section_html, citation_detail_html)"""
     brand_label = brand_names[0]
     try:
@@ -538,6 +539,11 @@ def _render_geo_and_citation(gen_prompts, gen_prompts_error, tech, brand_names, 
             save_snapshot(config.SUPABASE_URL, config.SUPABASE_KEY, target_domain_key,
                           exposure_score, citation_share, mention_share)
         history = get_history(config.SUPABASE_URL, config.SUPABASE_KEY, target_domain_key)
+        # 요약 숫자 3개와 별개로, 이번 실행의 프롬프트별 원본 결과를 전부 적재한다 —
+        # 나중에 프롬프트별 이력·"경쟁사는 인용됐는데 우리는 안 된 페이지" 같은 걸 만들려면
+        # 이 원본이 필요하다. 성공/실패 여부와 무관하게 시도한 프롬프트 전부 기록한다.
+        save_prompt_runs(config.SUPABASE_URL, config.SUPABASE_KEY, target_domain_key,
+                          geo["records"], prompt_topics)
 
         if quota_banner:
             # 전부 429면 "—" 투성이 점수·비교·프롬프트 목록을 늘어놔봐야 정보가 없다.
@@ -694,9 +700,12 @@ def _stream_analyze(target, page_html, tech, scores, rx, brand_names, brand_doma
 
         def build_gemini_chunk():
             nonlocal done
+            prompt_topics = ({p["prompt"]: p.get("topic") for p in saved_prompts}
+                              if using_saved_prompts else {})
             geo_html, cite_html = _render_geo_and_citation(
                 gen_state["value"], gen_state["error"], tech, brand_names, brand_domains, target,
                 saved_competitors, prompts_source="saved" if using_saved_prompts else "generated",
+                prompt_topics=prompt_topics,
             )
             done += 1
             script = f"fillEl('ph-geo','{_b64(geo_html)}');"

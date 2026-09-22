@@ -10,6 +10,7 @@ import requests
 from datetime import date, timedelta
 
 TABLE = "geo_history"
+RUNS_TABLE = "geo_prompt_runs"
 
 
 def _headers(api_key):
@@ -37,6 +38,47 @@ def save_snapshot(supabase_url, supabase_key, domain, exposure_score, citation_s
                 "citation_share": citation_share,
                 "mention_share": mention_share,
             },
+            timeout=10,
+        )
+    except Exception:
+        pass
+
+
+def save_prompt_runs(supabase_url, supabase_key, domain, records, prompt_topics=None):
+    """
+    geo_history가 하루치 요약 숫자 3개만 남기는 것과 달리, 이건 그 실행의 프롬프트별
+    원본 결과(언급/인용/인용 URL/경쟁사 결과)를 한 행씩 그대로 적재한다. 나중에
+    프롬프트별 이력, "경쟁사는 인용됐는데 우리는 안 된 페이지" 같은 걸 만들려면
+    요약값만으로는 안 되고 이 원본이 있어야 한다. 하루에 여러 번 실행해도 안 덮어쓰고
+    행이 계속 쌓인다 — upsert가 아니라 순수 insert.
+    records: run_geo_visibility()가 반환하는 geo["records"] 그대로.
+    prompt_topics: {prompt_text: topic|None} — 저장된 프롬프트를 쓴 경우에만 채워짐.
+    실패해도 조용히 넘어간다 — 부가 기능이라 본 분석 결과에 영향을 주면 안 된다.
+    """
+    if not (supabase_url and supabase_key) or not records:
+        return
+    prompt_topics = prompt_topics or {}
+    today = date.today().isoformat()
+    rows = [
+        {
+            "domain": domain,
+            "date": today,
+            "prompt": rec["prompt"],
+            "topic": prompt_topics.get(rec["prompt"]),
+            "status": rec["status"],
+            "mentioned": rec["mentioned"],
+            "cited": rec["cited"],
+            "cited_urls": rec["cited_urls"],
+            "competitor_mentions": rec["competitor_mentions"],
+            "competitor_citations": rec["competitor_citations"],
+        }
+        for rec in records
+    ]
+    try:
+        requests.post(
+            f"{supabase_url}/rest/v1/{RUNS_TABLE}",
+            headers={**_headers(supabase_key), "Prefer": "return=minimal"},
+            json=rows,
             timeout=10,
         )
     except Exception:
