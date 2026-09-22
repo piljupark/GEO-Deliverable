@@ -515,7 +515,11 @@ button{width:100%;padding:11px;background:#14161A;color:#fff;border:none;
   border-radius:2px;font-size:14px;cursor:pointer}
 button:disabled{opacity:.6;cursor:default}
 .err{color:#c5221f;font-size:12.5px;margin-bottom:10px}
-.wait-note{display:none;margin-top:10px;font-size:12px;color:#5B5F66;text-align:center}
+.wait-note{display:none;margin-top:14px}
+.progress-track{width:100%;height:6px;background:#E4E4E1;border-radius:3px;overflow:hidden}
+.progress-fill{width:0%;height:100%;background:#14161A;border-radius:3px}
+.progress-label{font-size:11.5px;color:#9A9DA3;text-align:center;margin-top:8px;line-height:1.5}
+.progress-pct{color:#14161A;font-weight:500}
 label.sub-label{display:block;font-size:11.5px;color:#9A9DA3;margin:2px 0 6px}
 </style></head><body>
 <form class="box" method="get" action="/_content/analyze" onsubmit="
@@ -523,6 +527,13 @@ label.sub-label{display:block;font-size:11.5px;color:#9A9DA3;margin:2px 0 6px}
   b.disabled=true; b.innerText='분석 중입니다...';
   this.querySelector('.wait-note').style.display='block';
   try{localStorage.setItem('geo_competitors', this.competitors.value);}catch(e){}
+  var fill=this.querySelector('.progress-fill'), pctEl=this.querySelector('.progress-pct'), pct=0;
+  setInterval(function(){
+    pct += (92 - pct) * 0.06;
+    var shown = Math.min(92, Math.round(pct));
+    fill.style.width = shown + '%';
+    pctEl.textContent = shown + '%';
+  }, 400);
 ">
   <h1>URL 분석</h1>
   <p>분석할 사이트 주소를 입력하면 기술 진단과 GEO 산출물을 바로 생성합니다.</p>
@@ -531,7 +542,12 @@ label.sub-label{display:block;font-size:11.5px;color:#9A9DA3;margin:2px 0 6px}
   <label class="sub-label">경쟁사 URL (선택, 쉼표로 구분, 최대 2개) — 한 번 넣으면 다음에도 기억합니다</label>
   <input name="competitors" placeholder="https://competitor1.com, https://competitor2.com" value="{prev_competitors}">
   <button type="submit">분석하기</button>
-  <div class="wait-note">사이트 크롤링·현재 GEO 상태·웹 성능·AI 노출 확인을 순서대로 진행합니다. 경쟁사를 넣으면 더 걸릴 수 있어요.</div>
+  <div class="wait-note">
+    <div class="progress-track"><div class="progress-fill"></div></div>
+    <div class="progress-label">
+      <span class="progress-pct">0%</span> · 크롤링·GEO 상태·웹 성능·AI 노출을 동시에 확인 중입니다 (예상 진행률)
+    </div>
+  </div>
 </form>
 <script>
 (function(){

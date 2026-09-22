@@ -20,10 +20,12 @@ def collect_pagespeed(url, api_key=None, strategy="mobile"):
     strategy: "mobile" 또는 "desktop" — 모바일 우선이 기본(구글 검색도 모바일 우선 색인)
     항상 실제 API를 호출한다. api_key가 없어도 쿼터만 낮을 뿐 호출은 그대로 시도한다.
     """
+    # performance 카테고리만 요청한다 — 실제로 화면엔 성능 점수/LCP/CLS/TBT만 쓰는데
+    # accessibility/best-practices/seo까지 같이 시키면 Lighthouse가 그만큼 더 오래 걸린다.
     params = {
         "url": url,
         "strategy": strategy,
-        "category": ["performance", "accessibility", "best-practices", "seo"],
+        "category": "performance",
     }
     if api_key:
         params["key"] = api_key
