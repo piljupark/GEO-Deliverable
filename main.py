@@ -32,6 +32,7 @@ from collectors.prescribe import prescribe
 from collectors.pagespeed import collect_pagespeed
 from collectors.geo_gemini import generate_prompts, run_geo_visibility, guess_brand_name
 from collectors.geo_status import check_current_geo_status
+from collectors.history_store import save_snapshot, get_history
 from generators.artifacts import generate_all
 from generators.scoring import score_categories, score_tier
 from layout import sidebar_shell
@@ -306,6 +307,38 @@ def _cite_domain(u):
     return (urlparse(u).netloc or u).lower().lstrip("www.")
 
 
+def _render_trend_svg(points, color="#2a78d6"):
+    """points: [(date_str, value|None), ...] 오름차순. 값이 2개 미만이면 그릴 게 없어 빈 문자열.
+    단일 시계열이라 범례 없음 — 끝점에 값만 직접 라벨링한다 (dataviz 마크 규칙)."""
+    vals = [v for _, v in points if v is not None]
+    if len(vals) < 2:
+        return ""
+    w, h, pad = 280, 72, 8
+    lo, hi = min(vals), max(vals)
+    rng = (hi - lo) or 1
+    n = len(points)
+    step = (w - 2 * pad) / (n - 1) if n > 1 else 0
+    coords = []
+    for i, (_, v) in enumerate(points):
+        if v is None:
+            continue
+        x = pad + i * step
+        y = h - pad - (v - lo) / rng * (h - 2 * pad)
+        coords.append((x, y))
+    poly = " ".join(f"{x:.1f},{y:.1f}" for x, y in coords)
+    area = f"{coords[0][0]:.1f},{h - pad:.1f} " + poly + f" {coords[-1][0]:.1f},{h - pad:.1f}"
+    last_x, last_y = coords[-1]
+    last_val = vals[-1]
+    return f"""
+    <svg viewBox="0 0 {w} {h}" width="100%" height="{h}" preserveAspectRatio="none" style="display:block">
+      <polygon points="{area}" fill="{color}" opacity="0.1"></polygon>
+      <polyline points="{poly}" fill="none" stroke="{color}" stroke-width="2"
+        stroke-linejoin="round" stroke-linecap="round"></polyline>
+      <circle cx="{last_x:.1f}" cy="{last_y:.1f}" r="4" fill="{color}"></circle>
+    </svg>
+    <div class="trend-val">최근값 {last_val}%</div>"""
+
+
 def _render_geo_and_citation(gen_prompts, gen_prompts_error, tech, brand_name, target, competitor_data):
     """AI 노출(Gemini) + 인용 상세 카드를 만든다. 실패하면 가짜 점수 대신 명확한 에러만 표시.
     반환값: (geo_section_html, citation_detail_html)"""
@@ -491,13 +524,39 @@ def _render_geo_and_citation(gen_prompts, gen_prompts_error, tech, brand_name, t
 
         if quota_banner:
             # 전부 429면 "—" 투성이 점수·비교·프롬프트 목록을 늘어놔봐야 정보가 없다.
-            # 배너 하나로 끝낸다.
+            # 배너 하나로 끝낸다. 저장할 실측치도 없으니 추이 조회도 건너뛴다.
             geo_section = f"""
             <div class="card" id="ph-geo">
               <h2>AI 노출 (Gemini)</h2>
               {quota_banner}
             </div>"""
             return geo_section, citation_detail_section
+
+        # 추이 — Supabase에 오늘 값을 저장하고(설정 안 했으면 조용히 무시), 과거 이력을
+        # 가져와 라인 차트로. 이력이 2개 미만이면 그릴 게 없어 카드 자체가 안 뜬다.
+        target_domain_key = _cite_domain(target)
+        if total:
+            save_snapshot(config.SUPABASE_URL, config.SUPABASE_KEY, target_domain_key,
+                          exposure_score, citation_share, mention_share)
+        history = get_history(config.SUPABASE_URL, config.SUPABASE_KEY, target_domain_key)
+        trend_section = ""
+        if history:
+            exp_pts = [(h["date"], h["exposure_score"]) for h in history]
+            cit_pts = [(h["date"], h["citation_share"]) for h in history]
+            men_pts = [(h["date"], h["mention_share"]) for h in history]
+            exp_svg = _render_trend_svg(exp_pts, "#2a78d6")
+            cit_svg = _render_trend_svg(cit_pts, "#1baf7a")
+            men_svg = _render_trend_svg(men_pts, "#eb6834")
+            if exp_svg or cit_svg or men_svg:
+                trend_section = f"""
+                <div class="card">
+                  <h2>추이 (최근 {len(history)}일)</h2>
+                  <div class="trend-grid">
+                    <div class="trend-item"><h3>노출도 점수</h3>{exp_svg or '<div class="issue-empty">데이터 부족</div>'}</div>
+                    <div class="trend-item"><h3>인용 점유율</h3>{cit_svg or '<div class="issue-empty">데이터 부족</div>'}</div>
+                    <div class="trend-item"><h3>언급 점유율</h3>{men_svg or '<div class="issue-empty">데이터 부족</div>'}</div>
+                  </div>
+                </div>"""
 
         geo_rows = ""
         for rec in geo["records"]:
@@ -532,6 +591,7 @@ def _render_geo_and_citation(gen_prompts, gen_prompts_error, tech, brand_name, t
           </div>
           {geo_rows}
         </div>
+        {trend_section}
         {exposure_bar_html}
         {mention_share_html}"""
         return geo_section, citation_detail_section
@@ -829,6 +889,9 @@ a.reanalyze{font-size:12.5px;color:var(--ink);border-bottom:1px solid var(--line
 .bar-track{flex:1;height:16px;background:#ECECE9;border-radius:3px;overflow:hidden}
 .bar-fill{height:100%;border-radius:3px;min-width:2px}
 .bar-value{width:40px;flex:0 0 auto;font-size:12px;color:var(--dim2);text-align:right}
+.trend-val{text-align:right;font-size:11px;color:var(--dim2);margin-top:2px}
+.trend-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-top:8px}
+.trend-item h3{font-size:12.5px;font-weight:500;color:var(--dim);margin:0 0 8px}
 .card-h{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
 button.copy{border:1px solid var(--ink);background:transparent;color:var(--ink);
   padding:5px 12px;font-size:12px;border-radius:2px;cursor:pointer}

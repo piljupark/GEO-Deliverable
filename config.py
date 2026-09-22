@@ -29,3 +29,11 @@ PAGESPEED_API_KEY = _env("PAGESPEED_API_KEY", "")
 # /analyze에 입력된 URL을 크롤링한 정보를 바탕으로 질문을 자동 생성해서 즉석으로 확인한다.
 GEMINI_API_KEY = _env("GEMINI_API_KEY", "")
 GEMINI_MODEL = _env("GEMINI_MODEL", "gemini-flash-latest")
+
+# ---- Supabase (선택) — 노출도/인용/언급 추이 그래프를 위한 이력 저장용 ----
+# Render는 재배포마다 로컬 파일시스템이 초기화되므로, 우리 앱 바깥의 관리형 DB에
+# 저장해야 이력이 유지된다. 이건 남의 계정 데이터가 아니라 우리 앱 자체의 분석
+# 이력이라 소유권 인증 문제와 무관하다. 설정 안 하면 추이 그래프만 조용히 빠지고
+# 나머지 기능은 그대로 작동한다.
+SUPABASE_URL = _env("SUPABASE_URL", "")
+SUPABASE_KEY = _env("SUPABASE_KEY", "")  # Settings → API → service_role 키 사용
