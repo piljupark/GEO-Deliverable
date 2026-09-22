@@ -19,6 +19,18 @@ def _domain(url):
     return (urlparse(url).netloc or url).lower().lstrip("www.")
 
 
+def guess_brand_name(tech):
+    """
+    <title>은 보통 "브랜드 | 부가설명 | ..." 형태라 전체를 그대로 브랜드명으로 쓰면
+    AI 응답 텍스트와 거의 매칭이 안 된다. 구분자 앞부분만 브랜드로 추정한다.
+    """
+    title = (tech.get("title") or "").strip()
+    for sep in ("|", " - ", "–", "·", ":"):
+        if sep in title:
+            return title.split(sep)[0].strip()
+    return title
+
+
 def query_gemini(prompt_text, api_key, model="gemini-2.5-flash"):
     """
     Gemini에 프롬프트 1개를 실제로 던지고 (Google Search grounding 활성화),
@@ -48,6 +60,25 @@ def query_gemini(prompt_text, api_key, model="gemini-2.5-flash"):
     return text, cited_urls
 
 
+def _name_variants(name, domain):
+    """
+    브랜드명 하나만 정확히 일치시키면 재현율이 너무 낮다(제목 전체 vs AI가 짧게 부르는 이름).
+    이름 전체, 이름의 첫 단어, 도메인의 대표 이름(예: kma.or.kr -> kma)까지 후보로 본다.
+    """
+    variants = set()
+    name = (name or "").strip()
+    if name:
+        variants.add(name.lower())
+        first_word = name.split()[0] if " " in name else name
+        if len(first_word) >= 2:
+            variants.add(first_word.lower())
+    if domain:
+        bare = _domain(domain).split(".")[0]
+        if len(bare) >= 2:
+            variants.add(bare.lower())
+    return variants
+
+
 def detect_mentions(text, cited_urls, brand_name, brand_domain, competitors=None):
     """
     text: Gemini 응답 텍스트
@@ -58,14 +89,16 @@ def detect_mentions(text, cited_urls, brand_name, brand_domain, competitors=None
     text_low = text.lower()
     cited_domains = [_domain(u) for u in cited_urls]
 
-    mentioned = bool(brand_name) and brand_name.lower() in text_low
+    brand_terms = _name_variants(brand_name, brand_domain)
+    mentioned = any(t in text_low for t in brand_terms)
     cited = bool(brand_domain) and _domain(brand_domain) in cited_domains
 
     competitor_mentions = {}
     competitor_citations = {}
     for c in competitors:
         name, domain = c.get("name", ""), c.get("domain", "")
-        competitor_mentions[name or domain] = bool(name) and name.lower() in text_low
+        terms = _name_variants(name, domain)
+        competitor_mentions[name or domain] = any(t in text_low for t in terms)
         competitor_citations[name or domain] = bool(domain) and _domain(domain) in cited_domains
 
     return {

@@ -6,8 +6,10 @@ Signal 대시보드 웹앱.
   GET  /login          로그인 폼
   POST /login          로그인 처리
   GET  /logout
-  GET  /                검색성과+처방 대시보드 (로그인 필요)
+  GET  /                URL 즉석분석 (메인, 로그인 필요) — AI 노출/기술 SEO/웹 성능
+  GET  /monitor          검색성과+처방 대시보드, 내 사이트 모니터링용 (로그인 필요)
   GET  /ads              GA4+광고 리포트 (로그인 필요)
+  GET  /artifacts         내 사이트 GEO 산출물 (로그인 필요)
   GET  /refresh?token=..  데이터 새로고침 (cron-job.org가 호출, REFRESH_TOKEN으로 보호)
 """
 
@@ -31,7 +33,7 @@ from collectors.prescribe import prescribe
 from collectors.serp import rank_keywords
 from collectors.competitor import compare_sites
 from collectors.tracker import growth_summary
-from collectors.geo_gemini import generate_prompts, run_geo_visibility
+from collectors.geo_gemini import generate_prompts, run_geo_visibility, guess_brand_name
 from generators.artifacts import generate_all
 from generators.scoring import score_categories, score_tier
 from layout import sidebar_shell
@@ -97,13 +99,13 @@ def logout(request: Request):
     return RedirectResponse("/login", status_code=303)
 
 
-# ---------------- 대시보드 ----------------
+# ---------------- 검색 성과 대시보드 (내 사이트 모니터링) ----------------
 
-@app.get("/", response_class=HTMLResponse)
+@app.get("/monitor", response_class=HTMLResponse)
 def dashboard_shell(request: Request):
     if not _require_login(request):
         return RedirectResponse("/login", status_code=303)
-    return HTMLResponse(sidebar_shell("dashboard", "/_content/dashboard", title="리포트"))
+    return HTMLResponse(sidebar_shell("dashboard", "/_content/dashboard", title="검색 성과"))
 
 
 @app.get("/_content/dashboard", response_class=HTMLResponse)
@@ -328,7 +330,7 @@ pre{{background:#F3F3F1;border:1px solid var(--line);border-radius:2px;padding:1
 <div class="app">
   <header class="topbar">
     <div><h1>GEO 산출물</h1><div class="sub">생성 {generated_at} · robots.txt / llms.txt / JSON-LD</div></div>
-    <nav><a href="/">대시보드</a><a href="/ads">광고 리포트</a><a href="/logout">로그아웃</a></nav>
+    <nav><a href="/">URL 분석</a><a href="/monitor">검색 성과</a><a href="/ads">광고 리포트</a><a href="/logout">로그아웃</a></nav>
   </header>
 
   <div class="card">
@@ -361,11 +363,16 @@ function cp(id) {{
 """
 
 
-@app.get("/analyze", response_class=HTMLResponse)
+@app.get("/", response_class=HTMLResponse)
 def analyze_shell(request: Request):
     if not _require_login(request):
         return RedirectResponse("/login", status_code=303)
-    return sidebar_shell("analyze", "/_content/analyze", title="URL 분석")
+    return HTMLResponse(sidebar_shell("analyze", "/_content/analyze", title="URL 분석"))
+
+
+@app.get("/analyze")
+def analyze_legacy_redirect():
+    return RedirectResponse("/", status_code=301)
 
 
 @app.get("/_content/analyze", response_class=HTMLResponse)
@@ -389,7 +396,7 @@ def analyze_content(request: Request, url: str = ""):
         r = _rq.get(target, headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT)
         tech = audit_technical(r.url, r.text)
     except Exception as e:
-        return HTMLResponse(ANALYZE_FORM_PAGE.replace(
+        return HTMLResponse(ANALYZE_FORM_TEMPLATE.replace(
             "{error}", f"<div class='err'>크롤 실패: {type(e).__name__} — URL을 확인해주세요.</div>"
         ).replace("{prev_url}", target))
 
@@ -459,7 +466,7 @@ def analyze_content(request: Request, url: str = ""):
             gen_prompts = generate_prompts(tech, config.GEMINI_API_KEY, config.GEMINI_MODEL, count=5)
             geo = run_geo_visibility(
                 gen_prompts, config.GEMINI_API_KEY, config.GEMINI_MODEL,
-                brand_name=config.BRAND_NAME or tech.get("title") or target,
+                brand_name=config.BRAND_NAME or guess_brand_name(tech) or target,
                 brand_domain=target,
                 competitors=_build_competitors(),
             )
@@ -519,7 +526,7 @@ def analyze_content(request: Request, url: str = ""):
     return HTMLResponse(page)
 
 
-ANALYZE_FORM_PAGE = """
+ANALYZE_FORM_TEMPLATE = """
 <!DOCTYPE html><html lang="ko"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
@@ -544,7 +551,7 @@ button{width:100%;padding:11px;background:#14161A;color:#fff;border:none;
 </form>
 </body></html>
 """
-ANALYZE_FORM_PAGE = ANALYZE_FORM_PAGE.replace("{error}", "").replace("{prev_url}", "")
+ANALYZE_FORM_PAGE = ANALYZE_FORM_TEMPLATE.replace("{error}", "").replace("{prev_url}", "")
 
 
 ANALYZE_RESULT_PAGE = """

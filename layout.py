@@ -12,10 +12,12 @@ def _esc(s):
 
 
 NAV_ITEMS = [
-    ("분석", [
-        ("리포트", "/", "dashboard"),
+    ("진단", [
+        ("URL 분석", "/", "analyze"),
+    ]),
+    ("내 사이트 모니터링", [
+        ("검색 성과", "/monitor", "dashboard"),
         ("홈페이지 분석", "/artifacts", "artifacts"),
-        ("URL 분석", "/analyze", "analyze"),
         ("광고 리포트", "/ads", "ads"),
     ]),
     ("설정", [

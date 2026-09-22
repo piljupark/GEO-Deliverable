@@ -138,8 +138,8 @@ TARGET_KEYWORDS = 강사 섭외,강사 매칭
 
 ## 6. 접속
 
-`https://본인앱주소.onrender.com` 접속 → 로그인(APP_USERNAME/APP_PASSWORD) → 대시보드.
-광고 리포트는 `/ads` 경로.
+`https://본인앱주소.onrender.com` 접속 → 로그인(APP_USERNAME/APP_PASSWORD) → **URL 분석**(메인 화면, 아무 URL이나 넣으면 즉석 진단).
+내 사이트 검색 성과는 `/monitor`, 광고 리포트는 `/ads` 경로.
 
 ---
 
