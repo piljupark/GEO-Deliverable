@@ -522,23 +522,41 @@ def _render_geo_and_citation(gen_prompts, gen_prompts_error, tech, brand_name, t
               {page_rows}
             </div>"""
 
-        if quota_banner:
-            # 전부 429면 "—" 투성이 점수·비교·프롬프트 목록을 늘어놔봐야 정보가 없다.
-            # 배너 하나로 끝낸다. 저장할 실측치도 없으니 추이 조회도 건너뛴다.
-            geo_section = f"""
-            <div class="card" id="ph-geo">
-              <h2>AI 노출 (Gemini)</h2>
-              {quota_banner}
-            </div>"""
-            return geo_section, citation_detail_section
-
         # 추이 — Supabase에 오늘 값을 저장하고(설정 안 했으면 조용히 무시), 과거 이력을
         # 가져와 라인 차트로. 이력이 2개 미만이면 그릴 게 없어 카드 자체가 안 뜬다.
+        # 오늘 쿼터 초과로 저장할 실측치가 없어도, 과거에 쌓인 이력은 그대로 보여준다.
         target_domain_key = _cite_domain(target)
         if total:
             save_snapshot(config.SUPABASE_URL, config.SUPABASE_KEY, target_domain_key,
                           exposure_score, citation_share, mention_share)
         history = get_history(config.SUPABASE_URL, config.SUPABASE_KEY, target_domain_key)
+
+        if quota_banner:
+            # 전부 429면 "—" 투성이 점수·비교·프롬프트 목록을 늘어놔봐야 정보가 없다.
+            # 배너 하나로 끝내되, 과거 추이 데이터는 있으면 이어서 보여준다.
+            geo_section = f"""
+            <div class="card" id="ph-geo">
+              <h2>AI 노출 (Gemini)</h2>
+              {quota_banner}
+            </div>"""
+            if history:
+                exp_pts = [(h["date"], h["exposure_score"]) for h in history]
+                cit_pts = [(h["date"], h["citation_share"]) for h in history]
+                men_pts = [(h["date"], h["mention_share"]) for h in history]
+                exp_svg = _render_trend_svg(exp_pts, "#2a78d6")
+                cit_svg = _render_trend_svg(cit_pts, "#1baf7a")
+                men_svg = _render_trend_svg(men_pts, "#eb6834")
+                if exp_svg or cit_svg or men_svg:
+                    geo_section += f"""
+                    <div class="card">
+                      <h2>추이 (최근 {len(history)}일)</h2>
+                      <div class="trend-grid">
+                        <div class="trend-item"><h3>노출도 점수</h3>{exp_svg or '<div class="issue-empty">데이터 부족</div>'}</div>
+                        <div class="trend-item"><h3>인용 점유율</h3>{cit_svg or '<div class="issue-empty">데이터 부족</div>'}</div>
+                        <div class="trend-item"><h3>언급 점유율</h3>{men_svg or '<div class="issue-empty">데이터 부족</div>'}</div>
+                      </div>
+                    </div>"""
+            return geo_section, citation_detail_section
         trend_section = ""
         if history:
             exp_pts = [(h["date"], h["exposure_score"]) for h in history]
