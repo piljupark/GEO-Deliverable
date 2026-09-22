@@ -13,7 +13,7 @@ def _esc(s):
 
 NAV_ITEMS = [
     ("진단", [
-        ("URL 분석", "/", "analyze"),
+        ("분석 실행", "/", "analyze"),
     ]),
     ("설정", [
         ("내 사이트", "/settings/site", "settings-site"),
