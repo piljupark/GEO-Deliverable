@@ -463,7 +463,7 @@ def analyze_content(request: Request, url: str = ""):
         </div>"""
     else:
         try:
-            gen_prompts = generate_prompts(tech, config.GEMINI_API_KEY, config.GEMINI_MODEL, count=5)
+            gen_prompts = generate_prompts(tech, config.GEMINI_API_KEY, config.GEMINI_MODEL, count=3)
             geo = run_geo_visibility(
                 gen_prompts, config.GEMINI_API_KEY, config.GEMINI_MODEL,
                 brand_name=config.BRAND_NAME or guess_brand_name(tech) or target,
@@ -540,14 +540,21 @@ input{width:100%;padding:11px 12px;border:1px solid #E4E4E1;border-radius:2px;
   font-size:14px;box-sizing:border-box;margin-bottom:10px}
 button{width:100%;padding:11px;background:#14161A;color:#fff;border:none;
   border-radius:2px;font-size:14px;cursor:pointer}
+button:disabled{opacity:.6;cursor:default}
 .err{color:#c5221f;font-size:12.5px;margin-bottom:10px}
+.wait-note{display:none;margin-top:10px;font-size:12px;color:#5B5F66;text-align:center}
 </style></head><body>
-<form class="box" method="get" action="/_content/analyze">
+<form class="box" method="get" action="/_content/analyze" onsubmit="
+  var b=this.querySelector('button');
+  b.disabled=true; b.innerText='분석 중입니다...';
+  this.querySelector('.wait-note').style.display='block';
+">
   <h1>URL 분석</h1>
   <p>분석할 사이트 주소를 입력하면 기술 진단과 GEO 산출물을 바로 생성합니다.</p>
   {error}
   <input name="url" placeholder="https://example.com" value="{prev_url}" autofocus>
   <button type="submit">분석하기</button>
+  <div class="wait-note">사이트 크롤링·웹 성능·AI 노출 확인을 순서대로 진행합니다. 최대 1분 정도 걸릴 수 있어요.</div>
 </form>
 </body></html>
 """
