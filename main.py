@@ -317,11 +317,21 @@ def analyze_content(request: Request, url: str = "", competitors: str = ""):
                 competitors=competitors_for_gemini,
             )
             live = [r for r in geo["records"] if r["status"] == "LIVE"]
+            errored = [r for r in geo["records"] if r["status"] != "LIVE"]
             total = len(live)
             mentioned_count = sum(1 for r in live if r["mentioned"])
             cited_count = sum(1 for r in live if r["cited"])
             exposure_score = round(mentioned_count / total * 100) if total else None
             citation_share = round(cited_count / total * 100) if total else None
+
+            # 전부 429(쿼터 초과)로 실패한 경우, 개별 에러 대신 원인을 명확히 알려준다.
+            quota_banner = ""
+            if not live and errored and all("429" in r["detail"] for r in errored):
+                quota_banner = """
+                <div class="issue-empty" style="margin-bottom:14px">
+                  Gemini 무료 쿼터를 초과했습니다 — 분당 한도면 1분 후, 일일 한도면 하루 지나야 복구됩니다.
+                  오늘 반복 테스트를 많이 하셨다면 일일 한도일 가능성이 큽니다.
+                </div>"""
 
             # 경쟁사별 노출도/인용 점유율 — 자사와 같은 질문 세트를 같은 응답에서 함께 판별한 것.
             comparison_rows = ""
@@ -367,6 +377,7 @@ def analyze_content(request: Request, url: str = "", competitors: str = ""):
             <div class="card">
               <h2>AI 노출 (Gemini)</h2>
               <div class="sub-inline">자동 생성된 질문 {len(geo['records'])}개 중 {total}개 성공 · Google Search grounding 기반 실데이터</div>
+              {quota_banner}
               <div class="scores" style="margin:14px 0 18px;grid-template-columns:repeat(2,1fr)">
                 <div class="score-card">
                   <div class="score-label">노출도 점수</div>
@@ -381,10 +392,14 @@ def analyze_content(request: Request, url: str = "", competitors: str = ""):
               {geo_rows}
             </div>"""
         except Exception as e:
+            if "429" in str(e):
+                msg = "Gemini 무료 쿼터를 초과했습니다 — 분당 한도면 1분 후, 일일 한도면 하루 지나야 복구됩니다."
+            else:
+                msg = f"확인 실패: {html.escape(str(e))}"
             geo_section = f"""
             <div class="card">
               <h2>AI 노출 (Gemini)</h2>
-              <div class="issue-empty">확인 실패: {html.escape(str(e))}</div>
+              <div class="issue-empty">{msg}</div>
             </div>"""
 
     page = ANALYZE_RESULT_PAGE.format(

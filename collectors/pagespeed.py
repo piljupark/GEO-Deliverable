@@ -31,7 +31,8 @@ def collect_pagespeed(url, api_key=None, strategy="mobile"):
     try:
         # 실제 서버에서 풀 Lighthouse 감사를 돌리는 API라 느릴 때가 많고, 타임아웃/5xx가
         # 종종 일시적으로 난다 — 짧게 재시도한다.
-        resp = request_with_retry("GET", ENDPOINT, params=params, timeout=60)
+        # 60초씩 3번 재시도하면 최악의 경우 3분 걸린다 — 2번으로 제한.
+        resp = request_with_retry("GET", ENDPOINT, params=params, timeout=60, attempts=2)
         data = resp.json()
     except Exception as e:
         return {
