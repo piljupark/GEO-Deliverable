@@ -337,21 +337,107 @@ def _render_geo_and_citation(gen_prompts, gen_prompts_error, tech, brand_name, t
               오늘 반복 테스트를 많이 하셨다면 일일 한도일 가능성이 큽니다.
             </div>"""
 
-        # 경쟁사별 노출도/인용 점유율 — 자사와 같은 질문 세트를 같은 응답에서 함께 판별한 것.
-        comparison_rows = ""
-        if competitors_for_gemini:
-            comparison_rows += f"""
-            <div class="share-row"><span>{html.escape(brand_name)} (자사)</span>
-              <span>노출 {exposure_score if exposure_score is not None else "—"}% · 인용 {citation_share if citation_share is not None else "—"}%</span></div>"""
-            for comp in competitors_for_gemini:
-                name = comp["name"]
-                cm = sum(1 for rec in live if rec["competitor_mentions"].get(name))
-                cc = sum(1 for rec in live if rec["competitor_citations"].get(name))
-                ce = round(cm / total * 100) if total else None
-                cs = round(cc / total * 100) if total else None
-                comparison_rows += f"""
-                <div class="share-row"><span>{html.escape(name)}</span>
-                  <span>노출 {ce if ce is not None else "—"}% · 인용 {cs if cs is not None else "—"}%</span></div>"""
+        # 경쟁사별 노출도/인용 — 자사와 같은 질문 세트를 같은 응답에서 함께 판별한 것.
+        tracked = [(brand_name, mentioned_count, cited_count)]
+        for comp in competitors_for_gemini:
+            name = comp["name"]
+            cm = sum(1 for rec in live if rec["competitor_mentions"].get(name))
+            cc = sum(1 for rec in live if rec["competitor_citations"].get(name))
+            tracked.append((name, cm, cc))
+
+        # 노출도 순위 — 등록한 사이트들(자사+경쟁사) 안에서의 순위. "시장 전체 1위"가 아니라
+        # "내가 등록한 비교 대상 중 순위"라는 걸 라벨에서 분명히 한다.
+        ranked = sorted(tracked, key=lambda t: -t[1])
+        self_rank = next((i for i, t in enumerate(ranked, 1) if t[0] == brand_name), None) if total else None
+
+        # 언급 점유율 — 개별 노출도(%)가 아니라 "전체 언급 중 내 비중" (share of voice).
+        total_mentions_all = sum(t[1] for t in tracked)
+        mention_share = round(mentioned_count / total_mentions_all * 100) if total_mentions_all else None
+
+        # 인용→브랜드 귀속률 — 우리 도메인이 인용된 답변 중, 브랜드명도 같이 언급된 비율.
+        cited_records = [rec for rec in live if rec["cited"]]
+        attributed_count = sum(1 for rec in cited_records if rec["mentioned"])
+        attribution_rate = (
+            round(attributed_count / len(cited_records) * 100) if cited_records else None
+        )
+
+        def _fmt_pct(v):
+            return f"{v}<span>/100</span>" if v is not None else "—"
+
+        overview_cards = f"""
+        <div class="score-card">
+          <div class="score-label">노출도 점수</div>
+          <div class="score-num">{_fmt_pct(exposure_score)}</div>
+          <div class="score-detail">완료된 응답 중 브랜드 언급 비율</div>
+        </div>
+        <div class="score-card">
+          <div class="score-label">노출도 순위</div>
+          <div class="score-num">{f"#{self_rank}" if self_rank else "—"}</div>
+          <div class="score-detail">등록한 {len(tracked)}개 사이트 중 순위</div>
+        </div>
+        <div class="score-card">
+          <div class="score-label">인용 점유율</div>
+          <div class="score-num">{_fmt_pct(citation_share)}</div>
+          <div class="score-detail">우리 도메인이 인용된 답변 비율</div>
+        </div>
+        <div class="score-card">
+          <div class="score-label">언급 점유율</div>
+          <div class="score-num">{_fmt_pct(mention_share)}</div>
+          <div class="score-detail">전체 언급 중 자사 비중 (경쟁사 대비)</div>
+        </div>
+        <div class="score-card">
+          <div class="score-label">인용→브랜드 귀속률</div>
+          <div class="score-num">{_fmt_pct(attribution_rate)}</div>
+          <div class="score-detail">인용 답변 {attributed_count}/{len(cited_records)}개에서 브랜드 언급</div>
+        </div>
+        <div class="score-card">
+          <div class="score-label">브랜드 언급 프롬프트</div>
+          <div class="score-num">{mentioned_count}<span>/{total if total else "—"}</span></div>
+          <div class="score-detail">답변에서 브랜드가 1회 이상 언급된 질문 수</div>
+        </div>"""
+
+        # 노출도 비교 막대그래프 — 자사는 강조색, 경쟁사는 회색(emphasis 형태: 비교 대상을
+        # 각각 구분하는 게 목적이 아니라 "자사 vs 나머지"가 이야기의 핵심이라서).
+        exposure_bar_html = ""
+        if competitors_for_gemini and total:
+            max_cnt = max(t[1] for t in tracked) or 1
+            for name, cnt, _ in ranked:
+                pct_of_max = round(cnt / max_cnt * 100)
+                is_self = name == brand_name
+                bar_color = "#2a78d6" if is_self else "#C3C2B7"
+                exposure_bar_html += f"""
+                <div class="bar-row">
+                  <div class="bar-label">{html.escape(name)}{' (자사)' if is_self else ''}</div>
+                  <div class="bar-track"><div class="bar-fill" style="width:{pct_of_max}%;background:{bar_color}"></div></div>
+                  <div class="bar-value">{round(cnt / total * 100)}%</div>
+                </div>"""
+            exposure_bar_html = f"""
+            <div class="card">
+              <h2>노출도 비교</h2>
+              <div class="sub-inline">같은 질문 세트 기준, 프롬프트 중 언급된 비율</div>
+              {exposure_bar_html}
+            </div>"""
+
+        # 언급 점유율 스택 바 — 전체 언급 중 각 사이트가 차지하는 비중 (part-to-whole).
+        mention_share_html = ""
+        if competitors_for_gemini and total_mentions_all:
+            palette = ["#2a78d6", "#eb6834", "#1baf7a"]
+            segs, legend = "", ""
+            for i, (name, cnt, _) in enumerate(tracked):
+                if not cnt:
+                    continue
+                color = palette[i % len(palette)]
+                pct = round(cnt / total_mentions_all * 100)
+                is_self = name == brand_name
+                segs += f'<div style="flex:{cnt} 0 0;background:{color}"></div>'
+                legend += f'<div class="legend-item"><span class="legend-swatch" style="background:{color}"></span>{html.escape(name)}{" (자사)" if is_self else ""} {pct}%</div>'
+            mention_share_html = f"""
+            <div class="card">
+              <h2>언급 점유율</h2>
+              <div class="sub-inline">경쟁사 대비 전체 언급에서 차지하는 비중</div>
+              <div class="stack-bar">{segs}</div>
+              <div class="legend-row">{legend}</div>
+            </div>"""
 
         # 인용 상세 — 실제로 인용된 URL을 도메인 기준 자사/경쟁사/제3자로 분류, 페이지별 순위화.
         target_domain = _cite_domain(target)
@@ -441,19 +527,13 @@ def _render_geo_and_citation(gen_prompts, gen_prompts_error, tech, brand_name, t
         <div class="card" id="ph-geo">
           <h2>AI 노출 (Gemini)</h2>
           <div class="sub-inline">자동 생성된 질문 {len(geo['records'])}개 중 {total}개 성공 · Google Search grounding 기반 실데이터</div>
-          <div class="scores" style="margin:14px 0 18px;grid-template-columns:repeat(2,1fr)">
-            <div class="score-card">
-              <div class="score-label">노출도 점수</div>
-              <div class="score-num">{exposure_score if exposure_score is not None else "—"}<span>/100</span></div>
-            </div>
-            <div class="score-card">
-              <div class="score-label">인용 점유율</div>
-              <div class="score-num">{citation_share if citation_share is not None else "—"}<span>/100</span></div>
-            </div>
+          <div class="scores" style="margin:14px 0 18px">
+            {overview_cards}
           </div>
-          {comparison_rows}
           {geo_rows}
-        </div>"""
+        </div>
+        {exposure_bar_html}
+        {mention_share_html}"""
         return geo_section, citation_detail_section
     except Exception as e:
         if "429" in str(e):
@@ -743,6 +823,12 @@ a.reanalyze{font-size:12.5px;color:var(--ink);border-bottom:1px solid var(--line
   text-overflow:ellipsis;white-space:nowrap}
 .cite-url:hover{text-decoration:underline}
 .cite-count{font-size:12px;color:var(--dim2);flex:0 0 auto}
+.bar-row{display:flex;align-items:center;gap:10px;padding:8px 0}
+.bar-label{width:120px;flex:0 0 auto;font-size:12.5px;color:var(--dim);overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
+.bar-track{flex:1;height:16px;background:#ECECE9;border-radius:3px;overflow:hidden}
+.bar-fill{height:100%;border-radius:3px;min-width:2px}
+.bar-value{width:40px;flex:0 0 auto;font-size:12px;color:var(--dim2);text-align:right}
 .card-h{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
 button.copy{border:1px solid var(--ink);background:transparent;color:var(--ink);
   padding:5px 12px;font-size:12px;border-radius:2px;cursor:pointer}
