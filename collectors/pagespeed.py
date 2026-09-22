@@ -28,7 +28,8 @@ def collect_pagespeed(url, api_key=None, strategy="mobile"):
         params["key"] = api_key
 
     try:
-        resp = requests.get(ENDPOINT, params=params, timeout=30)
+        # 실제 서버에서 풀 Lighthouse 감사를 돌리는 API라 30초를 넘기는 경우가 흔하다.
+        resp = requests.get(ENDPOINT, params=params, timeout=60)
         resp.raise_for_status()
         data = resp.json()
     except Exception as e:

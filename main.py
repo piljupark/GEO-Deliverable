@@ -289,7 +289,7 @@ button:disabled{opacity:.6;cursor:default}
   {error}
   <input name="url" placeholder="https://example.com" value="{prev_url}" autofocus>
   <button type="submit">분석하기</button>
-  <div class="wait-note">사이트 크롤링·웹 성능·AI 노출 확인을 순서대로 진행합니다. 최대 1분 정도 걸릴 수 있어요.</div>
+  <div class="wait-note">사이트 크롤링·웹 성능·AI 노출 확인을 순서대로 진행합니다. 최대 1~2분 정도 걸릴 수 있어요.</div>
 </form>
 </body></html>
 """
