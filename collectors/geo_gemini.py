@@ -76,6 +76,46 @@ def detect_mentions(text, cited_urls, brand_name, brand_domain, competitors=None
     }
 
 
+def generate_prompts(tech, api_key, model="gemini-2.5-flash", count=5):
+    """
+    크롤링된 사이트 정보(title/meta_desc/h1_texts)를 바탕으로, 이 사이트의 잠재 고객이
+    AI 챗봇에게 물어볼 법한 자연어 질문을 Gemini로 자동 생성한다 (grounding 없이 순수 생성).
+    실패 시 예외를 그대로 올린다 — 가짜 프롬프트로 대체하지 않는다.
+    """
+    site_desc = (
+        f"제목: {tech.get('title', '')}\n"
+        f"설명: {tech.get('meta_desc', '')}\n"
+        f"주요 페이지 제목: {', '.join(tech.get('h1_texts') or [])}"
+    )
+    ask = (
+        f"다음은 한 웹사이트 정보입니다.\n{site_desc}\n\n"
+        f"이 사이트의 잠재 고객이 AI 챗봇에게 물어볼 법한 자연어 질문을 정확히 {count}개 만들어줘. "
+        "브랜드명이나 회사명은 절대 포함하지 말고, 일반적인 니즈·비교·추천 요청 형태로 만들어줘. "
+        "각 질문을 한 줄에 하나씩, 번호나 다른 텍스트 없이 질문 문장만 출력해."
+    )
+    url = ENDPOINT_TMPL.format(model=model)
+    body = {"contents": [{"parts": [{"text": ask}]}]}
+    resp = requests.post(url, params={"key": api_key}, json=body, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+
+    candidates = data.get("candidates") or []
+    if not candidates:
+        raise ValueError("프롬프트 생성 응답이 비어 있습니다 (안전 필터 차단 가능성)")
+
+    parts = candidates[0].get("content", {}).get("parts", [])
+    text = "".join(p.get("text", "") for p in parts if "text" in p)
+
+    lines = []
+    for ln in text.split("\n"):
+        ln = re.sub(r"^[\d\.\-\)\s]+", "", ln).strip()
+        if ln:
+            lines.append(ln)
+    if not lines:
+        raise ValueError("생성된 프롬프트를 파싱하지 못했습니다")
+    return lines[:count]
+
+
 def run_geo_visibility(prompts, api_key, model, brand_name, brand_domain, competitors=None):
     """
     prompts: 추적할 질문 문자열 리스트

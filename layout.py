@@ -14,7 +14,6 @@ def _esc(s):
 NAV_ITEMS = [
     ("분석", [
         ("리포트", "/", "dashboard"),
-        ("AI 노출", "/geo", "geo"),
         ("홈페이지 분석", "/artifacts", "artifacts"),
         ("URL 분석", "/analyze", "analyze"),
         ("광고 리포트", "/ads", "ads"),

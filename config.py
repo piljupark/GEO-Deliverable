@@ -61,15 +61,9 @@ TARGET_KEYWORDS = [k.strip() for k in _env("TARGET_KEYWORDS", "").split(",") if 
 
 # ---- Gemini AI 노출 추적 (무료 티어) ----
 # console: aistudio.google.com/apikey 에서 무료로 발급 (신용카드 불필요)
+# /analyze에 입력된 URL을 크롤링한 정보를 바탕으로 질문을 자동 생성해서 즉석으로 확인한다.
 GEMINI_API_KEY = _env("GEMINI_API_KEY", "")
 GEMINI_MODEL = _env("GEMINI_MODEL", "gemini-2.5-flash")
-
-# 추적할 질문(프롬프트) 고정 목록. 실제 사용자가 물어볼 법한 자연어 질문을 직접 채워 넣는다.
-# 줄바꿈으로 구분해도 되고, 줄바꿈 입력이 어려운 환경이면 " | "로 구분해도 된다.
-# 예: 기업교육 서비스 잘하는 곳 추천해줘 | 강사 섭외 플랫폼 추천해줘
-GEO_PROMPTS = [
-    p.strip() for p in _env("GEO_PROMPTS", "").replace("|", "\n").split("\n") if p.strip()
-]
 
 # refresh 엔드포인트 보호용 (cron-job.org가 이 키를 같이 보내야 실행됨)
 REFRESH_TOKEN = _env("REFRESH_TOKEN", "")

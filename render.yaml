@@ -47,10 +47,8 @@ services:
         sync: false
       - key: TARGET_KEYWORDS
         sync: false
-      # 무료 발급: aistudio.google.com/apikey (카드 불필요)
+      # 무료 발급: aistudio.google.com/apikey (카드 불필요). /analyze의 AI 노출 체크에 사용
       - key: GEMINI_API_KEY
-        sync: false
-      - key: GEO_PROMPTS
         sync: false
       - key: DB_PATH
         value: "/opt/render/project/src/app.db"
