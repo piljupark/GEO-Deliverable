@@ -1,10 +1,12 @@
-# URL 즉석분석 — 클라우드 배포 가이드
+# 분석 실행 — 클라우드 배포 가이드
 
-아무 URL이나 입력하면 그 자리에서 기술 SEO·웹 성능·AI 노출·GEO 산출물을
-실데이터로 보여주는 웹앱. 계정 인증이 필요한 서비스는 쓰지 않으므로
-서비스 계정, cron 자동화, DB 영속성 같은 걸 신경 쓸 필요가 없다.
+"내 사이트" 설정에 등록해둔 사이트를 기준으로, 실행 버튼 하나로 기술 SEO·웹 성능·
+AI 노출·GEO 산출물을 실데이터로 보여주는 웹앱. 등록해둔 경쟁사·프롬프트도 매번
+그대로 반영돼서 날짜별 추이 비교가 가능하다. 계정 인증이 필요한 서비스(GSC/GA4/
+네이버 등)는 쓰지 않으므로 서비스 계정, cron 자동화는 필요 없지만, 설정 저장과
+추이 이력 때문에 **Supabase는 사실상 필수**다 (3-1번 참고).
 
-GitHub(코드 저장) → Render(실행/호스팅) 순서.
+GitHub(코드 저장) → Render(실행/호스팅) → Supabase(설정·이력 저장) 순서.
 
 ---
 
@@ -15,9 +17,13 @@ python -m pip install -r requirements.txt
 $env:APP_USERNAME="admin"
 $env:APP_PASSWORD="test1234"
 $env:SESSION_SECRET="testsecret"
+$env:SUPABASE_URL="..."
+$env:SUPABASE_KEY="..."
 uvicorn main:app --reload
 ```
-브라우저로 http://127.0.0.1:8000 접속 → 로그인 → URL 하나 넣고 분석해보기.
+브라우저로 http://127.0.0.1:8000 접속 → 로그인 → **내 사이트** 설정에서 사이트 등록
+→ 메인 화면에서 "지금 분석 실행". (SUPABASE_URL/KEY를 아직 안 넣었으면 "설정되지
+않음" 안내만 뜬다 — 3-1번부터 먼저 진행)
 
 ---
 
@@ -141,7 +147,8 @@ create index if not exists geo_prompt_runs_domain_date_idx on geo_prompt_runs (d
 ## 4. 접속
 
 `https://앱이름-xxxx.onrender.com` 접속 → 로그인(APP_USERNAME/APP_PASSWORD) →
-URL 입력창에 분석하고 싶은 사이트 주소를 넣고 분석.
+**내 사이트** 설정에서 사이트 주소(+ 필요하면 경쟁사, 프롬프트)를 등록 →
+메인 화면("분석 실행")에서 "지금 분석 실행" 클릭.
 
 **주의**: Render 무료 플랜은 15분 미접속 시 서버가 잠듭니다. 처음 접속 시 깨어나는 데
 최대 1분 정도 걸릴 수 있어요 (에러 아님, 정상).

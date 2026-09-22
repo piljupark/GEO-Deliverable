@@ -935,8 +935,13 @@ def _settings_unconfigured_page(feature_name):
 </body></html>"""
 
 
-def _render_site_settings_page(cfg, saved=False):
-    banner = '<div class="banner-ok">저장했습니다.</div>' if saved else ""
+def _render_site_settings_page(cfg, saved=False, error=False):
+    if error:
+        banner = '<div class="banner-err">저장하지 못했습니다 — Supabase 테이블(geo_site_config)이 만들어졌는지, 환경변수가 올바른지 확인해주세요.</div>'
+    elif saved:
+        banner = '<div class="banner-ok">저장했습니다.</div>'
+    else:
+        banner = ""
     site_urls_val = "\n".join(cfg["site_urls"])
     brand_aliases_val = "\n".join(cfg["brand_aliases"])
     return f"""<!DOCTYPE html><html lang="ko"><head><meta charset="utf-8">
@@ -964,9 +969,11 @@ def _render_site_settings_page(cfg, saved=False):
 </body></html>"""
 
 
-def _render_competitors_settings_page(competitors, added=False, deleted=False):
+def _render_competitors_settings_page(competitors, added=False, deleted=False, error=False):
     banner = ""
-    if added:
+    if error:
+        banner = '<div class="banner-err">처리하지 못했습니다 — Supabase 테이블(geo_competitors)이 만들어졌는지 확인해주세요.</div>'
+    elif added:
         banner = '<div class="banner-ok">경쟁사를 추가했습니다.</div>'
     elif deleted:
         banner = '<div class="banner-ok">경쟁사를 삭제했습니다.</div>'
@@ -1013,9 +1020,11 @@ def _render_competitors_settings_page(competitors, added=False, deleted=False):
 </body></html>"""
 
 
-def _render_prompts_settings_page(prompts, added=False, deleted=False):
+def _render_prompts_settings_page(prompts, added=False, deleted=False, error=False):
     banner = ""
-    if added:
+    if error:
+        banner = '<div class="banner-err">처리하지 못했습니다 — Supabase 테이블(geo_prompts)이 만들어졌는지 확인해주세요.</div>'
+    elif added:
         banner = '<div class="banner-ok">프롬프트를 추가했습니다.</div>'
     elif deleted:
         banner = '<div class="banner-ok">프롬프트를 삭제했습니다.</div>'
@@ -1088,6 +1097,8 @@ body{margin:0;background:var(--bg);color:var(--ink);font-family:'Pretendard',san
   border-radius:2px;font-size:12px;cursor:pointer;text-decoration:none;box-sizing:border-box}
 .banner-ok{background:#E6F4EC;color:#1E5E46;font-size:12.5px;padding:9px 12px;
   border-radius:2px;margin-bottom:16px}
+.banner-err{background:#FBE9E7;color:#c5221f;font-size:12.5px;padding:9px 12px;
+  border-radius:2px;margin-bottom:16px}
 .list-row{display:flex;align-items:center;gap:12px;padding:12px 0;border-top:1px solid #ECECE9}
 .list-row:first-child{border-top:none}
 .list-main{flex:1;min-width:0}
@@ -1111,24 +1122,25 @@ def settings_site_shell(request: Request):
 
 
 @app.get("/_content/settings/site", response_class=HTMLResponse)
-def settings_site_content(request: Request, saved: str = ""):
+def settings_site_content(request: Request, saved: str = "", error: str = ""):
     if not _require_login(request):
         return RedirectResponse("/login", status_code=303)
     if not settings_store.configured(config.SUPABASE_URL, config.SUPABASE_KEY):
         return HTMLResponse(_settings_unconfigured_page("내 사이트"))
     cfg = settings_store.get_site_config(config.SUPABASE_URL, config.SUPABASE_KEY)
-    return HTMLResponse(_render_site_settings_page(cfg, saved=bool(saved)))
+    return HTMLResponse(_render_site_settings_page(cfg, saved=bool(saved), error=bool(error)))
 
 
 @app.post("/_content/settings/site")
 def settings_site_save(request: Request, site_urls: str = Form(""), brand_aliases: str = Form("")):
     if not _require_login(request):
         return RedirectResponse("/login", status_code=303)
-    settings_store.save_site_config(
+    ok = settings_store.save_site_config(
         config.SUPABASE_URL, config.SUPABASE_KEY,
         _split_lines(site_urls), _split_lines(brand_aliases),
     )
-    return RedirectResponse("/_content/settings/site?saved=1", status_code=303)
+    qs = "saved=1" if ok else "error=1"
+    return RedirectResponse(f"/_content/settings/site?{qs}", status_code=303)
 
 
 @app.get("/settings/competitors", response_class=HTMLResponse)
@@ -1139,32 +1151,35 @@ def settings_competitors_shell(request: Request):
 
 
 @app.get("/_content/settings/competitors", response_class=HTMLResponse)
-def settings_competitors_content(request: Request, added: str = "", deleted: str = ""):
+def settings_competitors_content(request: Request, added: str = "", deleted: str = "", error: str = ""):
     if not _require_login(request):
         return RedirectResponse("/login", status_code=303)
     if not settings_store.configured(config.SUPABASE_URL, config.SUPABASE_KEY):
         return HTMLResponse(_settings_unconfigured_page("경쟁사 관리"))
     competitors = settings_store.list_competitors(config.SUPABASE_URL, config.SUPABASE_KEY)
-    return HTMLResponse(_render_competitors_settings_page(competitors, added=bool(added), deleted=bool(deleted)))
+    return HTMLResponse(_render_competitors_settings_page(
+        competitors, added=bool(added), deleted=bool(deleted), error=bool(error)))
 
 
 @app.post("/_content/settings/competitors/add")
 def settings_competitors_add(request: Request, name: str = Form(...), domain: str = Form(...), aliases: str = Form("")):
     if not _require_login(request):
         return RedirectResponse("/login", status_code=303)
-    settings_store.add_competitor(
+    ok = settings_store.add_competitor(
         config.SUPABASE_URL, config.SUPABASE_KEY,
         name.strip(), domain.strip(), _split_lines(aliases),
     )
-    return RedirectResponse("/_content/settings/competitors?added=1", status_code=303)
+    qs = "added=1" if ok else "error=1"
+    return RedirectResponse(f"/_content/settings/competitors?{qs}", status_code=303)
 
 
 @app.post("/_content/settings/competitors/{competitor_id}/delete")
 def settings_competitors_delete(request: Request, competitor_id: str):
     if not _require_login(request):
         return RedirectResponse("/login", status_code=303)
-    settings_store.delete_competitor(config.SUPABASE_URL, config.SUPABASE_KEY, competitor_id)
-    return RedirectResponse("/_content/settings/competitors?deleted=1", status_code=303)
+    ok = settings_store.delete_competitor(config.SUPABASE_URL, config.SUPABASE_KEY, competitor_id)
+    qs = "deleted=1" if ok else "error=1"
+    return RedirectResponse(f"/_content/settings/competitors?{qs}", status_code=303)
 
 
 @app.get("/settings/prompts", response_class=HTMLResponse)
@@ -1175,21 +1190,23 @@ def settings_prompts_shell(request: Request):
 
 
 @app.get("/_content/settings/prompts", response_class=HTMLResponse)
-def settings_prompts_content(request: Request, added: str = "", deleted: str = ""):
+def settings_prompts_content(request: Request, added: str = "", deleted: str = "", error: str = ""):
     if not _require_login(request):
         return RedirectResponse("/login", status_code=303)
     if not settings_store.configured(config.SUPABASE_URL, config.SUPABASE_KEY):
         return HTMLResponse(_settings_unconfigured_page("프롬프트 목록"))
     prompts = settings_store.list_prompts(config.SUPABASE_URL, config.SUPABASE_KEY)
-    return HTMLResponse(_render_prompts_settings_page(prompts, added=bool(added), deleted=bool(deleted)))
+    return HTMLResponse(_render_prompts_settings_page(
+        prompts, added=bool(added), deleted=bool(deleted), error=bool(error)))
 
 
 @app.post("/_content/settings/prompts/add")
 def settings_prompts_add(request: Request, topic: str = Form(""), prompt: str = Form(...)):
     if not _require_login(request):
         return RedirectResponse("/login", status_code=303)
-    settings_store.add_prompt(config.SUPABASE_URL, config.SUPABASE_KEY, topic.strip(), prompt.strip())
-    return RedirectResponse("/_content/settings/prompts?added=1", status_code=303)
+    ok = settings_store.add_prompt(config.SUPABASE_URL, config.SUPABASE_KEY, topic.strip(), prompt.strip())
+    qs = "added=1" if ok else "error=1"
+    return RedirectResponse(f"/_content/settings/prompts?{qs}", status_code=303)
 
 
 @app.post("/_content/settings/prompts/{prompt_id}/toggle")
@@ -1198,19 +1215,22 @@ def settings_prompts_toggle(request: Request, prompt_id: str):
         return RedirectResponse("/login", status_code=303)
     prompts = settings_store.list_prompts(config.SUPABASE_URL, config.SUPABASE_KEY)
     current = next((p for p in prompts if str(p["id"]) == prompt_id), None)
+    ok = True
     if current is not None:
-        settings_store.set_prompt_archived(
+        ok = settings_store.set_prompt_archived(
             config.SUPABASE_URL, config.SUPABASE_KEY, prompt_id, not current.get("archived")
         )
-    return RedirectResponse("/_content/settings/prompts", status_code=303)
+    qs = "" if ok else "?error=1"
+    return RedirectResponse(f"/_content/settings/prompts{qs}", status_code=303)
 
 
 @app.post("/_content/settings/prompts/{prompt_id}/delete")
 def settings_prompts_delete(request: Request, prompt_id: str):
     if not _require_login(request):
         return RedirectResponse("/login", status_code=303)
-    settings_store.delete_prompt(config.SUPABASE_URL, config.SUPABASE_KEY, prompt_id)
-    return RedirectResponse("/_content/settings/prompts?deleted=1", status_code=303)
+    ok = settings_store.delete_prompt(config.SUPABASE_URL, config.SUPABASE_KEY, prompt_id)
+    qs = "deleted=1" if ok else "error=1"
+    return RedirectResponse(f"/_content/settings/prompts?{qs}", status_code=303)
 
 
 @app.get("/health", response_class=PlainTextResponse)
