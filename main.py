@@ -207,6 +207,39 @@ def _render_psi_card(psi):
     </div>"""
 
 
+def _render_tech_detail_card(tech):
+    """audit_technical() 원본 수치를 그대로 노출한다. 크롤링 시점에 이미 다 계산해두고
+    3개 점수·이슈목록으로만 요약해버리던 것들 — Gemini/PSI 쿼터와 무관하게 항상 나온다."""
+    def _tag_row(ok, label):
+        cls = "tag-yes" if ok else "tag-no"
+        val = "있음" if ok else "없음"
+        return f'<div class="share-row"><span>{html.escape(label)}</span><span class="tag {cls}">{val}</span></div>'
+
+    semantic_used = {k: v for k, v in tech["semantic_counts"].items() if v > 0}
+    semantic_str = ", ".join(f"{k} {v}개" for k, v in semantic_used.items()) or "없음"
+    heading_str = ", ".join(f"h{i} {tech['headings'][f'h{i}']}개" for i in range(1, 7) if tech["headings"][f"h{i}"] > 0) or "없음"
+    img_str = (f"총 {tech['img_total']}개 · alt 누락 {tech['img_no_alt_pct']}% · "
+               f"lazy-load {tech['img_lazy']}개 · 최신 포맷/최적화 {tech['img_modern_pct']}%"
+               if tech["img_total"] else "페이지에 이미지 없음")
+
+    return f"""
+    <div class="card">
+      <h2>기술 SEO 상세</h2>
+      <div class="sub-inline">지금 크롤링한 HTML을 직접 파싱한 결과 — 외부 API 없이 항상 확인 가능합니다.</div>
+      <div class="share-row"><span>감지된 프레임워크</span><span>{html.escape(tech['framework'])}</span></div>
+      <div class="share-row"><span>시맨틱 태그</span><span>{html.escape(semantic_str)}</span></div>
+      <div class="share-row"><span>div 태그 수</span><span>{tech['div_count']}개 (시맨틱 대비 {tech['div_ratio']}배)</span></div>
+      <div class="share-row"><span>제목 태그 구조</span><span>{html.escape(heading_str)}</span></div>
+      <div class="share-row"><span>제목 위계 건너뜀</span><span>{tech['hierarchy_skips']}곳</span></div>
+      <div class="share-row"><span>이미지</span><span>{html.escape(img_str)}</span></div>
+      {_tag_row(tech['has_canonical'], 'canonical 태그')}
+      {_tag_row(tech['has_lang'], 'html lang 속성')}
+      {_tag_row(tech['has_viewport'], 'viewport 메타')}
+      {_tag_row(tech['og_count'] > 0, f"Open Graph 태그 ({tech['og_count']}개)")}
+      {_tag_row(tech['twitter_count'] > 0, f"Twitter 카드 태그 ({tech['twitter_count']}개)")}
+    </div>"""
+
+
 def _render_issue_rows(rx):
     issue_rows = ""
     for i, t in enumerate(rx["todos"], 1):
@@ -639,6 +672,7 @@ def _stream_analyze(target, page_html, tech, scores, rx, brand_names, brand_doma
 
     seo_cards = _render_seo_score_cards(scores)
     issue_rows = _render_issue_rows(rx)
+    tech_detail_card = _render_tech_detail_card(tech)
 
     if gemini_enabled:
         gemini_placeholder = '<div class="card" id="ph-geo"><h2>AI 노출 (Gemini)</h2><div class="issue-empty">확인 중…</div></div>'
@@ -663,6 +697,7 @@ def _stream_analyze(target, page_html, tech, scores, rx, brand_names, brand_doma
   </div>
   <div class="scores">{seo_cards}<div class="score-card" id="ph-psi"><div class="score-label">웹 성능</div><div class="score-num" style="font-size:16px;color:var(--dim2)">측정 중…</div></div></div>
   <div class="card"><h2>발견된 이슈</h2>{issue_rows}</div>
+  {tech_detail_card}
   <div class="card" id="ph-geostatus"><h2>현재 GEO 상태 (실제 확인)</h2><div class="issue-empty">확인 중…</div></div>
   {gemini_placeholder}
   <div id="ph-citation"></div>
