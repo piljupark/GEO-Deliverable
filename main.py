@@ -29,6 +29,7 @@ import base64
 import html
 import re
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
@@ -44,7 +45,7 @@ from collectors.onpage import crawl_site, USER_AGENT, TIMEOUT
 from collectors.prescribe import prescribe
 from collectors.pagespeed import collect_pagespeed
 from collectors.geo_gemini import generate_prompts, run_geo_visibility, guess_brand_name
-from collectors.geo_status import check_current_geo_status
+from collectors.geo_status import check_robots_txt, check_llms_txt, check_sitemap, extract_existing_jsonld
 from collectors.history_store import save_snapshot, save_prompt_runs, get_history, get_citation_gaps
 from generators.artifacts import generate_all
 from generators.scoring import score_categories, score_tier
@@ -254,8 +255,16 @@ def _render_dashboard_summary(domain):
     읽기만 한다 — 여기서 새로 계산하면 개요 페이지가 다시 느려지는 의미가 없어진다.
     한 번도 확인 안 한 항목은 '확인 필요'로 표시하고 해당 페이지로 링크한다."""
     cards = []
+    # kind마다 따로 물어보면 캐시가 있어도 왕복이 4번이라 느려진다 — 한 번에 가져온다.
+    cached = cache_store.get_cache_multi(
+        config.SUPABASE_URL, config.SUPABASE_KEY, domain,
+        ["psi", "sitecrawl", "ai_exposure", "techcompare"],
+    )
+    psi = cached["psi"][0]
+    crawl = cached["sitecrawl"][0]
+    ai = cached["ai_exposure"][0]
+    comp = cached["techcompare"][0]
 
-    psi, _, _ = cache_store.get_cache(config.SUPABASE_URL, config.SUPABASE_KEY, domain, "psi")
     if psi and psi.get("performance") is not None:
         cards.append(("웹 성능", f"{psi['performance']}<span>/100</span>", score_tier(psi["performance"]), "/performance"))
     elif psi and (psi.get("field_data") or {}).get("lcp_ms") is not None:
@@ -263,14 +272,12 @@ def _render_dashboard_summary(domain):
     else:
         cards.append(("웹 성능", "—", "확인 필요", "/performance"))
 
-    crawl, _, _ = cache_store.get_cache(config.SUPABASE_URL, config.SUPABASE_KEY, domain, "sitecrawl")
     if crawl and crawl.get("pages"):
         broken = sum(1 for p in crawl["pages"] if p["status_code"] == 0 or p["status_code"] >= 400)
         cards.append(("사이트 진단", f"{len(crawl['pages'])}<span>페이지</span>", f"오류 {broken}개", "/sitecrawl"))
     else:
         cards.append(("사이트 진단", "—", "확인 필요", "/sitecrawl"))
 
-    ai, _, _ = cache_store.get_cache(config.SUPABASE_URL, config.SUPABASE_KEY, domain, "ai_exposure")
     ai_summary = (ai or {}).get("summary") or {}
     if ai_summary.get("status") == "ok":
         rank_str = f"#{ai_summary['self_rank']}" if ai_summary.get("self_rank") else "—"
@@ -279,7 +286,6 @@ def _render_dashboard_summary(domain):
     else:
         cards.append(("AI 노출", "—", "확인 필요", "/ai-exposure"))
 
-    comp, _, _ = cache_store.get_cache(config.SUPABASE_URL, config.SUPABASE_KEY, domain, "techcompare")
     if comp:
         ok_comps = [c for c in comp if c.get("scores")]
         cards.append(("경쟁사 비교", f"{len(ok_comps)}<span>개</span>", "비교 결과 있음", "/compare"))
@@ -300,12 +306,23 @@ def _render_dashboard_summary(domain):
 # ---------------- 개요: 기술 SEO 점수·이슈·GEO 상태 (저비용, 캐시 6시간) ----------------
 
 def _compute_overview(target):
-    r = requests.get(target, headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT)
+    # 대상 페이지 크롤과 robots.txt/llms.txt/sitemap.xml 확인은 서로 다른 요청이라
+    # 굳이 순서대로 기다릴 필요가 없다 — 동시에 보내서 가장 느린 것 하나 만큼만 기다린다.
+    # (JSON-LD 추출만 대상 페이지 HTML이 있어야 해서 크롤 완료 후 로컬에서 처리한다.)
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        fut_page = ex.submit(requests.get, target, headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT)
+        fut_robots = ex.submit(check_robots_txt, target)
+        fut_llms = ex.submit(check_llms_txt, target)
+        fut_sitemap = ex.submit(check_sitemap, target)
+        r = fut_page.result()
+        geo_status = {
+            "robots": fut_robots.result(), "llms": fut_llms.result(), "sitemap": fut_sitemap.result(),
+            "jsonld": extract_existing_jsonld(r.text),
+        }
     tech = audit_technical(r.url, r.text)
     tech["_security"] = _check_security_headers(r)
     scores = score_categories(tech)
     rx = prescribe(tech=tech)
-    geo_status = check_current_geo_status(target, r.text)
     brand_name = guess_brand_name(tech) or target
     artifacts = generate_all(tech, brand_name=brand_name or None, social_urls=None)
     return {
@@ -525,8 +542,15 @@ def _compute_ai_exposure(target, site_cfg, saved_competitors, saved_prompts):
         prompt_topics = {}
         prompts_source = "generated"
         try:
-            r = requests.get(target, headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT)
-            tech = audit_technical(r.url, r.text)
+            # 개요 페이지가 이미 신선한 크롤 결과를 캐시해뒀으면 그걸 재사용한다 —
+            # 프롬프트 생성 하나 때문에 같은 페이지를 또 크롤링할 필요는 없다.
+            overview_cached, _, overview_age = cache_store.get_cache(
+                config.SUPABASE_URL, config.SUPABASE_KEY, _cite_domain(target), "overview")
+            if overview_cached and overview_age is not None and overview_age < TTL_OVERVIEW:
+                tech = overview_cached["tech"]
+            else:
+                r = requests.get(target, headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT)
+                tech = audit_technical(r.url, r.text)
             brand_names, brand_domains = _resolve_brand_names(site_cfg, target, tech=tech)
             gen_prompts = generate_prompts(tech, config.GEMINI_API_KEY, config.GEMINI_MODEL, count=3)
         except Exception as e:

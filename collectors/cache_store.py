@@ -44,6 +44,35 @@ def get_cache(supabase_url, supabase_key, domain, kind):
         return None, None, None
 
 
+def get_cache_multi(supabase_url, supabase_key, domain, kinds):
+    """여러 kind를 한 번의 요청으로 읽는다. 종합 대시보드처럼 캐시 여러 개를 한 화면에
+    같이 보여줄 때, kind마다 따로 요청을 보내면(N번의 왕복) 정작 캐시가 있어도 그
+    조회 자체가 느려진다 — Supabase의 in.() 필터로 한 번에 가져온다.
+    반환: {kind: (data, fetched_at, age_seconds)} — 없는 kind는 (None, None, None)."""
+    result = {k: (None, None, None) for k in kinds}
+    if not (supabase_url and supabase_key) or not kinds:
+        return result
+    try:
+        resp = requests.get(
+            f"{supabase_url}/rest/v1/{TABLE}",
+            params={
+                "domain": f"eq.{domain}",
+                "kind": "in.(" + ",".join(kinds) + ")",
+                "select": "kind,data,fetched_at",
+            },
+            headers=_headers(supabase_key),
+            timeout=10,
+        )
+        resp.raise_for_status()
+        now = datetime.now(timezone.utc)
+        for row in resp.json():
+            fetched_at = datetime.fromisoformat(row["fetched_at"].replace("Z", "+00:00"))
+            result[row["kind"]] = (row["data"], fetched_at, (now - fetched_at).total_seconds())
+    except Exception:
+        pass
+    return result
+
+
 def save_cache(supabase_url, supabase_key, domain, kind, data):
     if not (supabase_url and supabase_key):
         return False

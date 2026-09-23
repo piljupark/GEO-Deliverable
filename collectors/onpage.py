@@ -7,8 +7,8 @@
 import re
 import time
 import json
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urljoin, urlparse
-from collections import deque
 from datetime import datetime, timezone
 
 import requests
@@ -125,54 +125,66 @@ def analyze_page(url, html, status_code, elapsed_ms):
     }
 
 
-def crawl_site(start_url, max_pages=25, delay=0.5):
-    """같은 도메인 내에서 BFS로 크롤링."""
+def _fetch_page(session, url):
+    try:
+        t0 = time.time()
+        resp = session.get(url, timeout=TIMEOUT, allow_redirects=True)
+        elapsed = (time.time() - t0) * 1000
+        ctype = resp.headers.get("Content-Type", "")
+        if "text/html" not in ctype:
+            return None
+        return analyze_page(url, resp.text, resp.status_code, elapsed)
+    except Exception as e:
+        return {
+            "url": url, "status_code": 0, "load_ms": 0, "title": "",
+            "issues": [("error", f"요청 실패: {type(e).__name__}")],
+            "_internal_urls": [], "h1": [], "schema_types": [],
+            "title_len": 0, "meta_desc_len": 0, "word_count": 0,
+            "img_count": 0, "img_missing_alt": 0, "h2_count": 0,
+            "internal_links": 0, "external_links": 0, "meta_description": "",
+            "canonical": "", "robots": "",
+        }
+
+
+def crawl_site(start_url, max_pages=25, delay=0.2, max_workers=5):
+    """같은 도메인 내에서 BFS로 크롤링. 한 번에 한 페이지씩 순서대로 받아오면 대상
+    사이트 하나 crawl하는 데만 페이지당 왕복시간 x 개수가 그대로 걸려서, 레벨(웨이브)
+    단위로 여러 페이지를 동시에 가져온다 — 15페이지면 순서대로 15번 왕복하는 대신
+    5개씩 3번 왕복하는 정도로 끝난다. delay는 다음 웨이브로 넘어가기 전에만 적용해서
+    대상 서버에 순간적으로 너무 많은 요청이 몰리는 걸 조금 눅여준다."""
     parsed = urlparse(start_url)
     root_netloc = parsed.netloc
 
-    seen = set()
-    queue = deque([start_url])
+    seen = {start_url}
+    frontier = [start_url]
     results = []
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT})
 
-    while queue and len(results) < max_pages:
-        url = queue.popleft()
-        if url in seen:
-            continue
-        seen.add(url)
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        while frontier and len(results) < max_pages:
+            batch = frontier[:max_pages - len(results)]
+            frontier = frontier[len(batch):]
+            pages = list(ex.map(lambda u: _fetch_page(session, u), batch))
 
-        try:
-            t0 = time.time()
-            resp = session.get(url, timeout=TIMEOUT, allow_redirects=True)
-            elapsed = (time.time() - t0) * 1000
-            ctype = resp.headers.get("Content-Type", "")
-            if "text/html" not in ctype:
-                continue
-            page = analyze_page(url, resp.text, resp.status_code, elapsed)
-        except Exception as e:
-            page = {
-                "url": url, "status_code": 0, "load_ms": 0, "title": "",
-                "issues": [("error", f"요청 실패: {type(e).__name__}")],
-                "_internal_urls": [], "h1": [], "schema_types": [],
-                "title_len": 0, "meta_desc_len": 0, "word_count": 0,
-                "img_count": 0, "img_missing_alt": 0, "h2_count": 0,
-                "internal_links": 0, "external_links": 0, "meta_description": "",
-                "canonical": "", "robots": "",
-            }
+            next_frontier = []
+            for page in pages:
+                if page is None:
+                    continue
+                for link in page.pop("_internal_urls", []):
+                    if link not in seen and urlparse(link).netloc == root_netloc:
+                        seen.add(link)
+                        next_frontier.append(link)
+                results.append(page)
+            frontier.extend(next_frontier)
 
-        # 큐에 내부 링크 추가
-        for link in page.pop("_internal_urls", []):
-            if link not in seen and urlparse(link).netloc == root_netloc:
-                queue.append(link)
-
-        results.append(page)
-        time.sleep(delay)
+            if frontier and len(results) < max_pages and delay:
+                time.sleep(delay)
 
     return {
         "domain": root_netloc,
         "crawled_at": datetime.now(timezone.utc).isoformat(),
-        "pages": results,
+        "pages": results[:max_pages],
     }
 
 
