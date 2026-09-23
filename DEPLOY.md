@@ -103,8 +103,14 @@ create table if not exists geo_history (
   exposure_score int,
   citation_share int,
   mention_share int,
+  seo_score int,
+  psi_score int,
   primary key (domain, date)
 );
+-- 이미 geo_history를 만들어뒀다면(이전 버전 사용자) 위 create table은 그냥
+-- 무시되니, 새로 추가된 컬럼만 이 두 줄로 채워주면 된다:
+alter table geo_history add column if not exists seo_score int;
+alter table geo_history add column if not exists psi_score int;
 
 create table if not exists geo_site_config (
   id smallint primary key default 1,

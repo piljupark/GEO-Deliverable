@@ -46,7 +46,7 @@ from collectors.prescribe import prescribe
 from collectors.pagespeed import collect_pagespeed
 from collectors.geo_gemini import generate_prompts, run_geo_visibility, guess_brand_name
 from collectors.geo_status import check_robots_txt, check_llms_txt, check_sitemap, extract_existing_jsonld
-from collectors.history_store import save_snapshot, save_prompt_runs, get_history, get_citation_gaps
+from collectors.history_store import save_snapshot, save_metric, save_prompt_runs, get_history, get_citation_gaps
 from generators.artifacts import generate_all
 from generators.scoring import score_categories, score_tier
 from layout import sidebar_shell
@@ -325,6 +325,12 @@ def _compute_overview(target):
     rx = prescribe(tech=tech)
     brand_name = guess_brand_name(tech) or target
     artifacts = generate_all(tech, brand_name=brand_name or None, social_urls=None)
+
+    # 기술 SEO 3개 점수를 평균 낸 값을 장기 추이에 남긴다 — 개요 페이지가 실제로
+    # 새로 계산될 때만(캐시 히트 땐 호출 자체가 안 됨) 오늘치 값을 채워넣는다.
+    seo_avg = round(sum(s["score"] for s in scores.values()) / len(scores))
+    save_metric(config.SUPABASE_URL, config.SUPABASE_KEY, _cite_domain(target), seo_score=seo_avg)
+
     return {
         "tech": tech, "scores": scores, "rx": rx,
         "geo_status": geo_status, "artifacts": artifacts, "brand_name": brand_name,
@@ -421,6 +427,8 @@ def _get_psi_or_fallback(target, domain, force_refresh):
         return fallback, old_fetched_at, True, None
 
     cache_store.save_cache(config.SUPABASE_URL, config.SUPABASE_KEY, domain, "psi", new_data)
+    if new_data.get("performance") is not None:
+        save_metric(config.SUPABASE_URL, config.SUPABASE_KEY, domain, psi_score=new_data["performance"])
     previous = (old_data if old_data and old_data.get("performance") is not None
                 and new_data.get("performance") is not None else None)
     return new_data, now, False, previous
@@ -657,10 +665,10 @@ def trends_content(request: Request):
     if early:
         return early
     history = get_history(config.SUPABASE_URL, config.SUPABASE_KEY, _cite_domain(target))
-    trend_html = _render_trend_section(history)
+    trend_html = _render_trend_section(history) + _render_tech_trend_section(history)
     if not trend_html:
         trend_html = ('<div class="card"><h2>추이</h2><div class="issue-empty">'
-                       '이력이 2일 미만이라 그래프를 그릴 수 없습니다. AI 노출 확인이 쌓이면 자동으로 채워집니다.'
+                       '이력이 2일 미만이라 그래프를 그릴 수 없습니다. 개요·웹 성능·AI 노출 확인이 쌓이면 자동으로 채워집니다.'
                        '</div></div>')
     body = f'<div class="topbar"><div class="url-label">분석 대상: {html.escape(target)}</div></div>' + trend_html
     return HTMLResponse(_page_wrap(body))
@@ -1137,6 +1145,28 @@ def _render_trend_section(history):
         <div class="trend-item"><h3>노출도 점수</h3>{exp_svg or '<div class="issue-empty">데이터 부족</div>'}</div>
         <div class="trend-item"><h3>인용 점유율</h3>{cit_svg or '<div class="issue-empty">데이터 부족</div>'}</div>
         <div class="trend-item"><h3>언급 점유율</h3>{men_svg or '<div class="issue-empty">데이터 부족</div>'}</div>
+      </div>
+    </div>"""
+
+
+def _render_tech_trend_section(history):
+    """SEO 종합 점수·웹 성능 점수 장기 추이. AI 노출과 달리 개요/웹 성능 페이지가
+    각자 실제로 새로 계산될 때만 채워지는 값이라, 두 페이지를 오간 이력이 있어야
+    쌓인다. 값이 2개 미만이면 그릴 게 없어 빈 문자열."""
+    if not history:
+        return ""
+    seo_pts = [(h["date"], h.get("seo_score")) for h in history]
+    psi_pts = [(h["date"], h.get("psi_score")) for h in history]
+    seo_svg = _render_trend_svg(seo_pts, "#2a78d6")
+    psi_svg = _render_trend_svg(psi_pts, "#1baf7a")
+    if not (seo_svg or psi_svg):
+        return ""
+    return f"""
+    <div class="card">
+      <h2>기술 SEO·성능 추이 (최근 {len(history)}일)</h2>
+      <div class="trend-grid">
+        <div class="trend-item"><h3>SEO 종합 점수</h3>{seo_svg or '<div class="issue-empty">데이터 부족</div>'}</div>
+        <div class="trend-item"><h3>웹 성능 점수</h3>{psi_svg or '<div class="issue-empty">데이터 부족</div>'}</div>
       </div>
     </div>"""
 
