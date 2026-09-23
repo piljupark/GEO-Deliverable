@@ -32,6 +32,7 @@ from starlette.middleware.sessions import SessionMiddleware
 import config
 from collectors import settings_store
 from collectors.tech_audit import audit_technical
+from collectors.onpage import crawl_site, USER_AGENT, TIMEOUT
 from collectors.prescribe import prescribe
 from collectors.pagespeed import collect_pagespeed
 from collectors.geo_gemini import generate_prompts, run_geo_visibility, guess_brand_name
@@ -139,11 +140,10 @@ def analyze_content(request: Request, run: str = ""):
     if not run:
         return HTMLResponse(_render_analyze_ready_page(target, site_cfg, saved_competitors, saved_prompts))
 
-    from collectors.onpage import USER_AGENT, TIMEOUT
-
     try:
         r = requests.get(target, headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT)
         tech = audit_technical(r.url, r.text)
+        tech["_security"] = _check_security_headers(r)
     except Exception as e:
         return HTMLResponse(_render_analyze_error_page(target, f"{type(e).__name__}: {e}"))
 
@@ -207,6 +207,80 @@ def _render_psi_card(psi):
     </div>"""
 
 
+_CRUX_TIER_KO = {"FAST": "좋음", "AVERAGE": "보통", "SLOW": "나쁨"}
+
+
+def _render_psi_detail_card(psi):
+    """Lighthouse의 접근성/권장사항/SEO 점수 + 실제 크롬 사용자 체감 속도(CrUX) +
+    개선 여지가 큰 항목(opportunities) — 같은 PSI 호출에 이미 들어있는데 안 쓰던 것들."""
+    if psi["source"].startswith("ERROR") or psi.get("performance") is None:
+        return '<div id="ph-psi-detail"></div>'
+
+    other_scores = ""
+    for key, label in (("accessibility", "접근성"), ("best_practices", "권장사항"), ("seo", "SEO")):
+        v = psi.get(key)
+        if v is not None:
+            other_scores += (f'<div class="share-row"><span>{label}</span>'
+                              f'<span>{v}/100 · {score_tier(v)}</span></div>')
+
+    field_html = ""
+    fd = psi.get("field_data")
+    if fd:
+        scope = "이 페이지" if fd["level"] == "page" else "도메인 전체 집계"
+        rows = ""
+        if fd.get("lcp_ms") is not None:
+            tier = _CRUX_TIER_KO.get(fd.get("lcp_category"), fd.get("lcp_category") or "—")
+            rows += f'<div class="share-row"><span>LCP (최대 콘텐츠풀 페인트)</span><span>{fd["lcp_ms"]}ms · {tier}</span></div>'
+        if fd.get("cls") is not None:
+            tier = _CRUX_TIER_KO.get(fd.get("cls_category"), fd.get("cls_category") or "—")
+            rows += f'<div class="share-row"><span>CLS (레이아웃 밀림)</span><span>{fd["cls"]} · {tier}</span></div>'
+        if fd.get("inp_ms") is not None:
+            tier = _CRUX_TIER_KO.get(fd.get("inp_category"), fd.get("inp_category") or "—")
+            rows += f'<div class="share-row"><span>INP (상호작용 응답성)</span><span>{fd["inp_ms"]}ms · {tier}</span></div>'
+        if rows:
+            field_html = f"""
+            <div class="cite-list-title">실제 방문자 체감 속도 ({scope} · Chrome 사용자 데이터)</div>
+            {rows}"""
+
+    opp_html = ""
+    opps = psi.get("opportunities") or []
+    if opps:
+        opp_rows = "".join(
+            f'<div class="issue-row"><span class="issue-num">{i}</span>'
+            f'<div><div class="issue-title">{html.escape(o["title"] or "")}</div>'
+            f'<div class="issue-why">예상 절감: {html.escape(o["display_value"] or "—")}</div></div></div>'
+            for i, o in enumerate(opps, 1)
+        )
+        opp_html = f'<div class="cite-list-title">개선 여지가 큰 항목</div>{opp_rows}'
+
+    if not (other_scores or field_html or opp_html):
+        return '<div id="ph-psi-detail"></div>'
+
+    return f"""
+    <div class="card" id="ph-psi-detail">
+      <h2>웹 성능 상세 (Lighthouse)</h2>
+      {other_scores}
+      {field_html}
+      {opp_html}
+    </div>"""
+
+
+SECURITY_HEADERS = [
+    ("Strict-Transport-Security", "HSTS (HTTPS 강제)"),
+    ("X-Content-Type-Options", "MIME 스니핑 방지"),
+    ("X-Frame-Options", "클릭재킹 방지"),
+    ("Content-Security-Policy", "콘텐츠 보안 정책(CSP)"),
+]
+
+
+def _check_security_headers(resp):
+    """이미 받아온 응답의 헤더만 읽는다 — 추가 요청·외부 API 없이 즉시 계산되는 위생 체크."""
+    present, missing = [], []
+    for key, label in SECURITY_HEADERS:
+        (present if key in resp.headers else missing).append(label)
+    return {"is_https": resp.url.startswith("https://"), "present": present, "missing": missing}
+
+
 def _render_tech_detail_card(tech):
     """audit_technical() 원본 수치를 그대로 노출한다. 크롤링 시점에 이미 다 계산해두고
     3개 점수·이슈목록으로만 요약해버리던 것들 — Gemini/PSI 쿼터와 무관하게 항상 나온다."""
@@ -221,6 +295,13 @@ def _render_tech_detail_card(tech):
     img_str = (f"총 {tech['img_total']}개 · alt 누락 {tech['img_no_alt_pct']}% · "
                f"lazy-load {tech['img_lazy']}개 · 최신 포맷/최적화 {tech['img_modern_pct']}%"
                if tech["img_total"] else "페이지에 이미지 없음")
+
+    sec = tech.get("_security")
+    sec_html = ""
+    if sec:
+        sec_html = _tag_row(sec["is_https"], "HTTPS 사용")
+        for key, label in SECURITY_HEADERS:
+            sec_html += _tag_row(label in sec["present"], label)
 
     return f"""
     <div class="card">
@@ -237,6 +318,121 @@ def _render_tech_detail_card(tech):
       {_tag_row(tech['has_viewport'], 'viewport 메타')}
       {_tag_row(tech['og_count'] > 0, f"Open Graph 태그 ({tech['og_count']}개)")}
       {_tag_row(tech['twitter_count'] > 0, f"Twitter 카드 태그 ({tech['twitter_count']}개)")}
+      <div class="cite-list-title">보안·위생</div>
+      {sec_html}
+    </div>"""
+
+
+SITECRAWL_MAX_PAGES = 15
+
+
+def _render_sitecrawl_card(crawl):
+    """crawl_site() 결과 — 한 페이지가 아니라 사이트 전체(최대 SITECRAWL_MAX_PAGES개)를
+    돌아본 결과라, 단일 페이지 감사에서는 안 보이던 깨진 링크·중복 제목 같은 게 나온다.
+    Gemini/PSI 쿼터와 무관하게 우리 서버가 직접 크롤링해서 얻는 실데이터다."""
+    pages = crawl["pages"]
+    total = len(pages)
+    if total == 0:
+        return """
+        <div class="card" id="ph-sitecrawl">
+          <h2>사이트 전체 진단</h2>
+          <div class="issue-empty">크롤링된 페이지가 없습니다.</div>
+        </div>"""
+
+    broken = [p for p in pages if p["status_code"] == 0 or p["status_code"] >= 400]
+    avg_load = round(sum(p["load_ms"] for p in pages) / total)
+    thin = [p for p in pages if p["status_code"] < 400 and p["status_code"] != 0 and p["word_count"] < 300]
+    alt_missing_total = sum(p.get("img_missing_alt", 0) for p in pages)
+    title_counts = Counter(p["title"] for p in pages if p.get("title"))
+    dup_titles = [t for t, c in title_counts.items() if c > 1]
+
+    rows = f"""
+    <div class="share-row"><span>크롤된 페이지</span><span>{total}개 (최대 {SITECRAWL_MAX_PAGES}개까지 확인)</span></div>
+    <div class="share-row"><span>평균 로드 시간</span><span>{avg_load}ms</span></div>
+    <div class="share-row"><span>오류/응답 실패 페이지</span><span>{len(broken)}개</span></div>
+    <div class="share-row"><span>콘텐츠 빈약 페이지 (300단어 미만)</span><span>{len(thin)}개</span></div>
+    <div class="share-row"><span>alt 없는 이미지 (전 페이지 합계)</span><span>{alt_missing_total}개</span></div>
+    <div class="share-row"><span>제목(title) 중복</span><span>{len(dup_titles)}건</span></div>"""
+
+    detail_rows = ""
+    if broken:
+        detail_rows += '<div class="cite-list-title">오류 페이지</div>'
+        for p in broken[:5]:
+            code = p["status_code"] if p["status_code"] else "요청 실패"
+            detail_rows += (f'<div class="cite-row"><span class="cite-url">{html.escape(p["url"])}</span>'
+                             f'<span class="cite-count">{code}</span></div>')
+    if dup_titles:
+        detail_rows += '<div class="cite-list-title">중복된 제목</div>'
+        for t in dup_titles[:5]:
+            urls = [p["url"] for p in pages if p.get("title") == t]
+            detail_rows += (f'<div class="cite-row"><span class="cite-url">{html.escape(t)}</span>'
+                             f'<span class="cite-count">{len(urls)}개 페이지</span></div>')
+
+    return f"""
+    <div class="card" id="ph-sitecrawl">
+      <h2>사이트 전체 진단</h2>
+      <div class="sub-inline">단일 페이지가 아니라 사이트 내부 링크를 따라가며 여러 페이지를 직접 크롤링한 결과입니다.</div>
+      {rows}
+      {detail_rows}
+    </div>"""
+
+
+def _run_competitor_tech_audit(competitors):
+    """등록된 경쟁사 도메인을 직접 크롤링해 우리 사이트와 같은 채점 기준(score_categories)을
+    적용한다. Gemini를 전혀 쓰지 않아 쿼터와 무관하게 항상 동작하는 비교 데이터다."""
+    results = []
+    for comp in competitors:
+        domain = (comp.get("domain") or "").strip()
+        name = comp.get("name") or domain or "경쟁사"
+        if not domain:
+            continue
+        url = domain if domain.startswith("http") else f"https://{domain}"
+        try:
+            r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT)
+            comp_tech = audit_technical(r.url, r.text)
+            results.append({"name": name, "scores": score_categories(comp_tech), "error": None})
+        except Exception as e:
+            results.append({"name": name, "scores": None, "error": f"{type(e).__name__}: {e}"})
+    return results
+
+
+def _render_techcompare_card(scores, brand_label, comp_results):
+    if not comp_results:
+        return '<div id="ph-techcompare"></div>'
+
+    ok_comps = [c for c in comp_results if c["scores"] is not None]
+    err_comps = [c for c in comp_results if c["scores"] is None]
+
+    groups = ""
+    for key, s in scores.items():
+        rows = f"""
+        <div class="bar-row">
+          <div class="bar-label">{html.escape(brand_label)} (자사)</div>
+          <div class="bar-track"><div class="bar-fill" style="width:{s['score']}%;background:#2a78d6"></div></div>
+          <div class="bar-value">{s['score']}</div>
+        </div>"""
+        for c in ok_comps:
+            v = c["scores"][key]["score"]
+            rows += f"""
+            <div class="bar-row">
+              <div class="bar-label">{html.escape(c['name'])}</div>
+              <div class="bar-track"><div class="bar-fill" style="width:{v}%;background:#C3C2B7"></div></div>
+              <div class="bar-value">{v}</div>
+            </div>"""
+        groups += f'<div class="cite-list-title">{html.escape(s["label"])}</div>{rows}'
+
+    err_html = "".join(
+        f'<div class="issue-row"><span class="tag tag-err">확인 실패</span>'
+        f'<div class="issue-title">{html.escape(c["name"])}</div></div>'
+        for c in err_comps
+    )
+
+    return f"""
+    <div class="card" id="ph-techcompare">
+      <h2>기술 SEO 비교</h2>
+      <div class="sub-inline">등록된 경쟁사 사이트를 직접 크롤링해 같은 기준으로 채점한 결과 — Gemini와 무관합니다.</div>
+      {groups}
+      {err_html}
     </div>"""
 
 
@@ -666,13 +862,19 @@ def _stream_analyze(target, page_html, tech, scores, rx, brand_names, brand_doma
     """
     gemini_enabled = bool(config.GEMINI_API_KEY)
     using_saved_prompts = gemini_enabled and bool(saved_prompts)
-    steps_total = 2
+    has_competitors = bool(saved_competitors)
+    steps_total = 3  # geostatus, psi, sitecrawl
+    if has_competitors:
+        steps_total += 1  # techcompare — Gemini와 무관하게 항상 돌기 때문에 gemini_enabled와 별개
     if gemini_enabled:
         steps_total += 1 if using_saved_prompts else 2
 
     seo_cards = _render_seo_score_cards(scores)
     issue_rows = _render_issue_rows(rx)
     tech_detail_card = _render_tech_detail_card(tech)
+    techcompare_placeholder = ("""
+        <div class="card" id="ph-techcompare"><h2>기술 SEO 비교</h2><div class="issue-empty">확인 중…</div></div>"""
+        if has_competitors else "")
 
     if gemini_enabled:
         gemini_placeholder = '<div class="card" id="ph-geo"><h2>AI 노출 (Gemini)</h2><div class="issue-empty">확인 중…</div></div>'
@@ -696,8 +898,11 @@ def _stream_analyze(target, page_html, tech, scores, rx, brand_names, brand_doma
     <div class="progress-label"><span id="pp">0%</span> · 분석 진행 중</div>
   </div>
   <div class="scores">{seo_cards}<div class="score-card" id="ph-psi"><div class="score-label">웹 성능</div><div class="score-num" style="font-size:16px;color:var(--dim2)">측정 중…</div></div></div>
+  <div id="ph-psi-detail"></div>
   <div class="card"><h2>발견된 이슈</h2>{issue_rows}</div>
   {tech_detail_card}
+  <div class="card" id="ph-sitecrawl"><h2>사이트 전체 진단</h2><div class="issue-empty">크롤링 중…</div></div>
+  {techcompare_placeholder}
   <div class="card" id="ph-geostatus"><h2>현재 GEO 상태 (실제 확인)</h2><div class="issue-empty">확인 중…</div></div>
   {gemini_placeholder}
   <div id="ph-citation"></div>
@@ -731,6 +936,9 @@ def _stream_analyze(target, page_html, tech, scores, rx, brand_names, brand_doma
         futures = {}
         futures[ex.submit(check_current_geo_status, target, page_html)] = "geostatus"
         futures[ex.submit(collect_pagespeed, target, api_key=config.PAGESPEED_API_KEY or None)] = "psi"
+        futures[ex.submit(crawl_site, target, max_pages=SITECRAWL_MAX_PAGES, delay=0.2)] = "sitecrawl"
+        if has_competitors:
+            futures[ex.submit(_run_competitor_tech_audit, saved_competitors)] = "techcompare"
         if gemini_enabled and not using_saved_prompts:
             futures[ex.submit(generate_prompts, tech, config.GEMINI_API_KEY, config.GEMINI_MODEL, count=3)] = "prompts"
 
@@ -768,8 +976,23 @@ def _stream_analyze(target, page_html, tech, scores, rx, brand_names, brand_doma
             elif kind == "psi":
                 psi = fut.result()
                 frag = _render_psi_card(psi)
+                detail_frag = _render_psi_detail_card(psi)
                 done += 1
-                yield f"<script>fillEl('ph-psi','{_b64(frag)}');</script>\n"
+                yield f"<script>fillEl('ph-psi','{_b64(frag)}');fillEl('ph-psi-detail','{_b64(detail_frag)}');</script>\n"
+                yield progress_script()
+
+            elif kind == "sitecrawl":
+                crawl = fut.result()
+                frag = _render_sitecrawl_card(crawl)
+                done += 1
+                yield f"<script>fillEl('ph-sitecrawl','{_b64(frag)}');</script>\n"
+                yield progress_script()
+
+            elif kind == "techcompare":
+                comp_results = fut.result()
+                frag = _render_techcompare_card(scores, brand_names[0], comp_results)
+                done += 1
+                yield f"<script>fillEl('ph-techcompare','{_b64(frag)}');</script>\n"
                 yield progress_script()
 
             elif kind == "prompts":

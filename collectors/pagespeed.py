@@ -20,12 +20,13 @@ def collect_pagespeed(url, api_key=None, strategy="mobile"):
     strategy: "mobile" 또는 "desktop" — 모바일 우선이 기본(구글 검색도 모바일 우선 색인)
     항상 실제 API를 호출한다. api_key가 없어도 쿼터만 낮을 뿐 호출은 그대로 시도한다.
     """
-    # performance 카테고리만 요청한다 — 실제로 화면엔 성능 점수/LCP/CLS/TBT만 쓰는데
-    # accessibility/best-practices/seo까지 같이 시키면 Lighthouse가 그만큼 더 오래 걸린다.
+    # 4개 카테고리를 한 번의 호출로 같이 받는다 — 어차피 Lighthouse가 페이지를 한 번
+    # 열어서 감사하는 거라, 카테고리를 늘려도 왕복 횟수는 늘지 않는다(그래도 다소 느려질
+    # 수는 있어서 아래 timeout을 넉넉히 잡는다).
     params = {
         "url": url,
         "strategy": strategy,
-        "category": "performance",
+        "category": ["performance", "seo", "accessibility", "best-practices"],
     }
     if api_key:
         params["key"] = api_key
@@ -43,6 +44,7 @@ def collect_pagespeed(url, api_key=None, strategy="mobile"):
             "performance": None, "accessibility": None,
             "best_practices": None, "seo": None,
             "lcp": None, "cls": None, "tbt": None,
+            "opportunities": [], "field_data": None,
             "detail": str(e),
         }
 
@@ -60,6 +62,44 @@ def collect_pagespeed(url, api_key=None, strategy="mobile"):
         a = audits.get(key)
         return a.get("displayValue") if a else None
 
+    # 랩(시뮬레이션) 데이터 말고 크롬 실제 방문자 데이터(CrUX) — 있으면 훨씬 신뢰도 높은
+    # "진짜 사용자 체감 속도"다. 트래픽이 적은 사이트는 페이지 단위 데이터가 없어서
+    # 도메인 전체 집계(originLoadingExperience)로 대체된다.
+    field_data = None
+    for key, level in (("loadingExperience", "page"), ("originLoadingExperience", "origin")):
+        exp = data.get(key)
+        if exp and exp.get("metrics"):
+            metrics = exp["metrics"]
+            field_data = {
+                "level": level,
+                "overall_category": exp.get("overall_category"),
+                "lcp_ms": (metrics.get("LARGEST_CONTENTFUL_PAINT_MS") or {}).get("percentile"),
+                "lcp_category": (metrics.get("LARGEST_CONTENTFUL_PAINT_MS") or {}).get("category"),
+                "cls": (metrics.get("CUMULATIVE_LAYOUT_SHIFT_SCORE") or {}).get("percentile"),
+                "cls_category": (metrics.get("CUMULATIVE_LAYOUT_SHIFT_SCORE") or {}).get("category"),
+                "inp_ms": (metrics.get("INTERACTION_TO_NEXT_PAINT") or {}).get("percentile"),
+                "inp_category": (metrics.get("INTERACTION_TO_NEXT_PAINT") or {}).get("category"),
+            }
+            break
+
+    # 개선 여지가 큰 순서로 상위 3개만 — 절감량(ms/byte)이 numericValue에 들어있다.
+    opportunities = []
+    for a in audits.values():
+        details = a.get("details") or {}
+        if details.get("type") != "opportunity":
+            continue
+        if a.get("score") is not None and a.get("score") >= 0.9:
+            continue
+        numeric_value = a.get("numericValue") or 0
+        if numeric_value <= 0:
+            continue
+        opportunities.append({
+            "title": a.get("title"),
+            "display_value": a.get("displayValue") or "",
+            "numeric_value": numeric_value,
+        })
+    opportunities.sort(key=lambda o: o["numeric_value"], reverse=True)
+
     return {
         "source": "LIVE",
         "fetched_at": datetime.now(timezone.utc).isoformat(),
@@ -71,4 +111,6 @@ def collect_pagespeed(url, api_key=None, strategy="mobile"):
         "lcp": _audit_value("largest-contentful-paint"),
         "cls": _audit_value("cumulative-layout-shift"),
         "tbt": _audit_value("total-blocking-time"),
+        "opportunities": opportunities[:3],
+        "field_data": field_data,
     }
