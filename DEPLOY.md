@@ -1,10 +1,12 @@
 # 분석 실행 — 클라우드 배포 가이드
 
-"내 사이트" 설정에 등록해둔 사이트를 기준으로, 실행 버튼 하나로 기술 SEO·웹 성능·
-AI 노출·GEO 산출물을 실데이터로 보여주는 웹앱. 등록해둔 경쟁사·프롬프트도 매번
-그대로 반영돼서 날짜별 추이 비교가 가능하다. 계정 인증이 필요한 서비스(GSC/GA4/
-네이버 등)는 쓰지 않으므로 서비스 계정, cron 자동화는 필요 없지만, 설정 저장과
-추이 이력 때문에 **Supabase는 사실상 필수**다 (3-1번 참고).
+"내 사이트" 설정에 등록해둔 사이트를 기준으로 기술 SEO·웹 성능·AI 노출·GEO
+산출물을 실데이터로 보여주는 웹앱. 비용/속도가 서로 다른 수집기(크롤링/PageSpeed/
+Gemini)를 목적별 페이지(개요·웹 성능·사이트 진단·AI 노출·경쟁사 비교·추이)로
+나누고, 각 결과를 Supabase에 캐시해뒀다가 TTL 이내면 재계산 없이 즉시 보여준다.
+계정 인증이 필요한 서비스(GSC/GA4/네이버 등)는 쓰지 않으므로 서비스 계정은
+필요 없지만, 설정 저장·캐시·추이 이력 때문에 **Supabase는 사실상 필수**다
+(3-1번 참고).
 
 GitHub(코드 저장) → Render(실행/호스팅) → Supabase(설정·이력 저장) 순서.
 
@@ -22,7 +24,7 @@ $env:SUPABASE_KEY="..."
 uvicorn main:app --reload
 ```
 브라우저로 http://127.0.0.1:8000 접속 → 로그인 → **내 사이트** 설정에서 사이트 등록
-→ 메인 화면에서 "지금 분석 실행". (SUPABASE_URL/KEY를 아직 안 넣었으면 "설정되지
+→ **개요** 페이지가 바로 뜨는지 확인. (SUPABASE_URL/KEY를 아직 안 넣었으면 "설정되지
 않음" 안내만 뜬다 — 3-1번부터 먼저 진행)
 
 ---
@@ -140,7 +142,38 @@ create table if not exists geo_prompt_runs (
   created_at timestamptz not null default now()
 );
 create index if not exists geo_prompt_runs_domain_date_idx on geo_prompt_runs (domain, date);
+
+-- 페이지별 분석 결과 캐시. domain+kind 기준으로 하나씩만 있고(최신 값으로 덮어씀),
+-- 각 페이지가 TTL 이내면 이 값을 그대로 쓰고 재계산을 건너뛴다.
+-- kind: overview / psi / sitecrawl / techcompare / ai_exposure
+create table if not exists geo_cache (
+  domain text not null,
+  kind text not null,
+  data jsonb not null,
+  fetched_at timestamptz not null default now(),
+  primary key (domain, kind)
+);
 ```
+
+---
+
+## 3-2. 예약 갱신 (선택 — 방문 전에 미리 캐시 채워두기)
+
+Render 무료 플랜엔 상시 크론이 없다. 대신 **GitHub Actions의 무료 scheduled workflow**로
+하루 1~2번 `/internal/refresh`를 호출하면, 사용자가 접속하기 전에 Supabase 캐시가 이미
+최신 상태가 돼서 모든 분석 페이지가 즉시 로딩된다. 추이 그래프가 원하는 "매일 스냅샷"도
+이 호출이 자동으로 만들어준다.
+
+1. Render 환경변수에 `REFRESH_TOKEN`을 아무 임의의 긴 문자열로 추가 (예: 32자 랜덤 문자열).
+   비워두면 `/internal/refresh`는 항상 403을 반환해 아무도 못 쓴다.
+2. `.github/workflows/daily-refresh.yml`이 저장소에 이미 있다 — 매일 UTC 21:00(KST 06:00)에
+   자동 실행되고, Actions 탭에서 수동 실행도 가능하다.
+3. GitHub 저장소 → Settings → Secrets and variables → Actions → New repository secret로 2개 추가:
+   - `REFRESH_URL` — 배포된 앱 주소, 예: `https://앱이름-xxxx.onrender.com` (끝에 슬래시 없이)
+   - `REFRESH_TOKEN` — 1번에서 Render에 넣은 것과 동일한 문자열
+
+이 엔드포인트는 Gemini까지 호출하므로(설정돼 있으면) 하루 1~2회 정도로만 예약하는 게
+무료 쿼터 관리에 안전하다.
 
 ---
 
@@ -148,7 +181,9 @@ create index if not exists geo_prompt_runs_domain_date_idx on geo_prompt_runs (d
 
 `https://앱이름-xxxx.onrender.com` 접속 → 로그인(APP_USERNAME/APP_PASSWORD) →
 **내 사이트** 설정에서 사이트 주소(+ 필요하면 경쟁사, 프롬프트)를 등록 →
-메인 화면("분석 실행")에서 "지금 분석 실행" 클릭.
+왼쪽 메뉴의 **개요/웹 성능/사이트 진단/AI 노출/경쟁사 비교/추이** 각 페이지에서 확인.
+개요는 항상 자동으로 뜨고, 나머지(웹 성능·사이트 진단·AI 노출)는 느리거나 쿼터가
+있어서 캐시가 없을 때만 새로 계산한다 — 최신 값이 필요하면 각 페이지의 "새로고침" 클릭.
 
 **주의**: Render 무료 플랜은 15분 미접속 시 서버가 잠듭니다. 처음 접속 시 깨어나는 데
 최대 1분 정도 걸릴 수 있어요 (에러 아님, 정상).
@@ -159,8 +194,10 @@ create index if not exists geo_prompt_runs_domain_date_idx on geo_prompt_runs (d
 
 | 증상 | 원인 |
 |---|---|
-| 분석하기 눌러도 반응이 늦음 | 크롤링+PageSpeed+Gemini를 순서대로 실제 호출하느라 최대 1분 정도 걸림. 버튼이 "분석 중입니다..."로 바뀌면 정상 진행 중 |
+| 웹 성능/사이트 진단/AI 노출 페이지가 오래 걸림 | 캐시가 없거나 만료돼서 실제로 새로 계산 중인 것 — 각각 PageSpeed(최대 2분)/사이트 크롤/Gemini 호출이라 느릴 수 있다. 한 번 계산되면 TTL 동안(6~24시간) 재방문 시 즉시 뜬다 |
 | "웹 성능: 측정 실패" | PageSpeed API 쿼터 초과(429) 가능성 큼 — `PAGESPEED_API_KEY`를 넣으면 대부분 해결 |
 | "AI 노출: GEMINI_API_KEY가 설정되지 않아..." | 아직 키를 안 넣은 것. 위 3번 참고 |
-| "AI 노출: 확인 실패: ..." | Gemini API 무료 쿼터 초과 또는 일시 오류. 잠시 후 재시도 |
+| "AI 노출: 확인 실패: ..." | Gemini API 무료 쿼터 초과 또는 일시 오류. 잠시 후 새로고침 |
 | "내 사이트/경쟁사/프롬프트 목록: SUPABASE_URL/SUPABASE_KEY가 설정되지 않아..." | 3-1번 SQL을 아직 안 돌렸거나 환경변수가 없는 것. 설정해도 테이블을 안 만들었으면 저장이 조용히 실패하니 SQL부터 실행 |
+| `/internal/refresh`가 403 | `REFRESH_TOKEN` 환경변수가 없거나 요청한 token 값과 다른 것. 3-2번 참고 |
+| 새로고침을 눌러도 값이 안 바뀜 | 캐시 TTL 이내라 의도적으로 재계산을 건너뛴 것. 각 페이지 URL 끝에 `?refresh=1`을 붙이면 강제로 새로 계산한다 |

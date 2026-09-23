@@ -39,3 +39,9 @@ GEMINI_MODEL = _env("GEMINI_MODEL", "gemini-flash-latest")
 # 안내만 뜨고 분석 실행 자체가 안 된다 — 등록된 사이트가 있어야 뭘 분석할지 알 수 있어서.
 SUPABASE_URL = _env("SUPABASE_URL", "")
 SUPABASE_KEY = _env("SUPABASE_KEY", "")  # Settings → API → service_role 키 사용
+
+# ---- 예약 갱신용 토큰 (선택) ----
+# Render 무료 플랜엔 상시 크론이 없어서, 외부 스케줄러(GitHub Actions 등)가
+# 하루 한 번 이 토큰으로 /internal/refresh를 호출해 캐시를 미리 채워둔다.
+# 비워두면 이 엔드포인트 자체가 항상 403을 반환해 아무도 못 쓴다.
+REFRESH_TOKEN = _env("REFRESH_TOKEN", "")

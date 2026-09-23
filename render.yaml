@@ -18,3 +18,13 @@ services:
       # 무료 발급: aistudio.google.com/apikey (카드 불필요). /analyze의 AI 노출 체크에 사용
       - key: GEMINI_API_KEY
         sync: false
+      # 사실상 필수: 내 사이트/경쟁사/프롬프트 설정 저장 + 분석 결과 캐시 + 추이 이력.
+      # 없으면 "설정되지 않음" 안내만 뜨고 분석 자체가 안 된다. DEPLOY.md 3-1번 참고.
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
+      # 선택: 외부 스케줄러(GitHub Actions 등)가 /internal/refresh를 호출할 때 쓰는 토큰.
+      # 비워두면 그 엔드포인트는 항상 403. DEPLOY.md 3-2번 참고.
+      - key: REFRESH_TOKEN
+        sync: false

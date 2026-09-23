@@ -1,0 +1,23 @@
+name: Daily refresh
+
+# Render 무료 플랜엔 상시 크론이 없어서, 이 무료 GitHub Actions 스케줄러가 하루 한 번
+# /internal/refresh를 호출해 분석 캐시를 미리 채워둔다. 자세한 설정은 DEPLOY.md 3-2번 참고.
+on:
+  schedule:
+    - cron: "0 21 * * *"  # 매일 06:00 KST(UTC 21:00) — 필요에 맞게 조정
+  workflow_dispatch: {}    # Actions 탭에서 수동 실행도 가능
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call /internal/refresh
+        env:
+          REFRESH_URL: ${{ secrets.REFRESH_URL }}
+          REFRESH_TOKEN: ${{ secrets.REFRESH_TOKEN }}
+        run: |
+          if [ -z "$REFRESH_URL" ] || [ -z "$REFRESH_TOKEN" ]; then
+            echo "REFRESH_URL/REFRESH_TOKEN secret이 설정되지 않았습니다 — DEPLOY.md 3-2번 참고" >&2
+            exit 1
+          fi
+          curl -fsS -X POST "${REFRESH_URL}/internal/refresh?token=${REFRESH_TOKEN}"

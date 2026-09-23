@@ -13,7 +13,12 @@ def _esc(s):
 
 NAV_ITEMS = [
     ("진단", [
-        ("분석 실행", "/", "analyze"),
+        ("개요", "/", "overview"),
+        ("웹 성능", "/performance", "performance"),
+        ("사이트 진단", "/sitecrawl", "sitecrawl"),
+        ("AI 노출", "/ai-exposure", "ai-exposure"),
+        ("경쟁사 비교", "/compare", "compare"),
+        ("추이", "/trends", "trends"),
     ]),
     ("설정", [
         ("내 사이트", "/settings/site", "settings-site"),

@@ -6,13 +6,21 @@
 "임의의 URL"에 적용할 수 없는 구조라 이 앱에는 없다 — 소유권 인증 없이는 그 데이터를
 아무도 내줄 수 없기 때문.
 
+비용/속도가 서로 다른 수집기를 한 페이지에서 전부 실행하면 가장 느린 것(PSI/Gemini)이
+전체를 끌고 내려가서, 페이지를 목적별로 분리했다. 각 페이지는 Supabase에 결과를
+캐시해두고 TTL 이내면 재계산 없이 즉시 로딩한다 — 새로고침을 원하면 ?refresh=1.
+
 라우트:
-  GET  /login          로그인 폼
-  POST /login          로그인 처리
-  GET  /logout
-  GET  /                분석 실행 셸 (로그인 필요)
-  GET  /_content/analyze          등록된 사이트 요약 + 실행 버튼 (iframe 안에서 로드됨)
-  GET  /_content/analyze?run=1    실제 분석 처리(스트리밍)
+  GET  /login, POST /login, GET /logout
+  GET  /                분석 개요 셸 (로그인 필요) — 이하 /performance, /sitecrawl,
+       /ai-exposure, /compare, /trends 도 각각 같은 셸+iframe 패턴
+  GET  /_content/overview        기술 SEO 점수·이슈·GEO 상태 (캐시 우선, 저비용)
+  GET  /_content/performance     PageSpeed Insights (캐시 우선, 느림)
+  GET  /_content/sitecrawl       사이트 전체 크롤 진단 (캐시 우선, 느림)
+  GET  /_content/ai-exposure     AI 노출·인용(Gemini) + 추이 (캐시 우선, 쿼터 있음)
+  GET  /_content/compare         경쟁사 기술 SEO 비교 (캐시 우선, Gemini 불필요)
+  GET  /_content/trends          Supabase 이력만 읽는 추이 그래프 (항상 즉시)
+  POST /internal/refresh?token=  전체 캐시 강제 갱신 (외부 스케줄러용, REFRESH_TOKEN 필요)
   GET  /settings/site, /settings/competitors, /settings/prompts  저장 설정 (로그인 필요)
   GET  /health
 """
@@ -21,7 +29,7 @@ import base64
 import html
 import re
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 import requests
@@ -30,7 +38,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, PlainTextResponse,
 from starlette.middleware.sessions import SessionMiddleware
 
 import config
-from collectors import settings_store
+from collectors import settings_store, cache_store
 from collectors.tech_audit import audit_technical
 from collectors.onpage import crawl_site, USER_AGENT, TIMEOUT
 from collectors.prescribe import prescribe
@@ -44,6 +52,13 @@ from layout import sidebar_shell
 
 app = FastAPI()
 app.add_middleware(SessionMiddleware, secret_key=config.SESSION_SECRET)
+
+# ---- 캐시 TTL(초) — 값이 자주 안 바뀌는 것일수록 길게 둔다 ----
+TTL_OVERVIEW = 6 * 3600
+TTL_PSI = 6 * 3600
+TTL_SITECRAWL = 24 * 3600
+TTL_COMPARE = 24 * 3600
+TTL_AI_EXPOSURE = 20 * 3600
 
 
 # ---------------- 인증 ----------------
@@ -102,10 +117,45 @@ def logout(request: Request):
 # ---------------- 분석 실행 ----------------
 
 @app.get("/", response_class=HTMLResponse)
-def analyze_shell(request: Request):
+def overview_shell(request: Request):
     if not _require_login(request):
         return RedirectResponse("/login", status_code=303)
-    return HTMLResponse(sidebar_shell("analyze", "/_content/analyze", title="분석 실행"))
+    return HTMLResponse(sidebar_shell("overview", "/_content/overview", title="개요"))
+
+
+@app.get("/performance", response_class=HTMLResponse)
+def performance_shell(request: Request):
+    if not _require_login(request):
+        return RedirectResponse("/login", status_code=303)
+    return HTMLResponse(sidebar_shell("performance", "/_content/performance", title="웹 성능"))
+
+
+@app.get("/sitecrawl", response_class=HTMLResponse)
+def sitecrawl_shell(request: Request):
+    if not _require_login(request):
+        return RedirectResponse("/login", status_code=303)
+    return HTMLResponse(sidebar_shell("sitecrawl", "/_content/sitecrawl", title="사이트 진단"))
+
+
+@app.get("/ai-exposure", response_class=HTMLResponse)
+def ai_exposure_shell(request: Request):
+    if not _require_login(request):
+        return RedirectResponse("/login", status_code=303)
+    return HTMLResponse(sidebar_shell("ai-exposure", "/_content/ai-exposure", title="AI 노출"))
+
+
+@app.get("/compare", response_class=HTMLResponse)
+def compare_shell(request: Request):
+    if not _require_login(request):
+        return RedirectResponse("/login", status_code=303)
+    return HTMLResponse(sidebar_shell("compare", "/_content/compare", title="경쟁사 비교"))
+
+
+@app.get("/trends", response_class=HTMLResponse)
+def trends_shell(request: Request):
+    if not _require_login(request):
+        return RedirectResponse("/login", status_code=303)
+    return HTMLResponse(sidebar_shell("trends", "/_content/trends", title="추이"))
 
 
 @app.get("/analyze")
@@ -120,53 +170,346 @@ def removed_feature_redirect():
     return RedirectResponse("/", status_code=301)
 
 
-@app.get("/_content/analyze", response_class=HTMLResponse)
-def analyze_content(request: Request, run: str = ""):
+# ---------------- 공통: 사이트 등록 확인 + 캐시 우선 계산 ----------------
+
+def _require_site(request: Request):
+    """로그인/Supabase 설정/사이트 등록 여부를 확인한다.
+    통과 시 (target, site_cfg, saved_competitors, saved_prompts, None),
+    막히면 (None, None, None, None, <바로 반환할 응답>)을 돌려준다."""
     if not _require_login(request):
-        return RedirectResponse("/login", status_code=303)
-
+        return None, None, None, None, RedirectResponse("/login", status_code=303)
     if not settings_store.configured(config.SUPABASE_URL, config.SUPABASE_KEY):
-        return HTMLResponse(_settings_unconfigured_page("분석 실행"))
-
+        return None, None, None, None, HTMLResponse(_settings_unconfigured_page("분석"))
     site_cfg = settings_store.get_site_config(config.SUPABASE_URL, config.SUPABASE_KEY)
     if not site_cfg["site_urls"]:
-        return HTMLResponse(_render_no_site_page())
-
+        return None, None, None, None, HTMLResponse(_render_no_site_page())
     target = site_cfg["site_urls"][0]
     saved_competitors = settings_store.list_competitors(config.SUPABASE_URL, config.SUPABASE_KEY)
     saved_prompts = settings_store.list_prompts(config.SUPABASE_URL, config.SUPABASE_KEY, include_archived=False)
+    return target, site_cfg, saved_competitors, saved_prompts, None
 
-    # run=1이 없으면 아직 실행 전 — 뭘 분석하게 되는지 요약만 보여주고 실행 버튼을 누르게 한다.
-    if not run:
-        return HTMLResponse(_render_analyze_ready_page(target, site_cfg, saved_competitors, saved_prompts))
 
-    try:
-        r = requests.get(target, headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT)
-        tech = audit_technical(r.url, r.text)
-        tech["_security"] = _check_security_headers(r)
-    except Exception as e:
-        return HTMLResponse(_render_analyze_error_page(target, f"{type(e).__name__}: {e}"))
+def _get_cached_or(domain, kind, ttl_seconds, force_refresh, compute_fn):
+    """캐시가 TTL 이내면 그대로, 아니면 compute_fn()을 실행해 새로 계산하고 캐시에 저장한다.
+    반환: (data, fetched_at, from_cache)."""
+    if not force_refresh:
+        data, fetched_at, age = cache_store.get_cache(config.SUPABASE_URL, config.SUPABASE_KEY, domain, kind)
+        if data is not None and age is not None and age < ttl_seconds:
+            return data, fetched_at, True
+    data = compute_fn()
+    now = datetime.now(timezone.utc)
+    cache_store.save_cache(config.SUPABASE_URL, config.SUPABASE_KEY, domain, kind, data)
+    return data, now, False
 
-    # 여기까지는 빠르고(크롤링 1번) 로컬 계산이라 즉시 끝난다. 느린 건 전부
-    # 스트리밍 응답 안에서 병렬로 처리하면서 단계마다 화면을 채워나간다.
+
+def _render_freshness_bar(target, fetched_at, from_cache, content_path):
+    ts = fetched_at.strftime("%m/%d %H:%M UTC") if fetched_at else "방금"
+    src = "캐시된 데이터" if from_cache else "방금 새로 확인"
+    return f"""
+    <div class="topbar">
+      <div class="url-label">분석 대상: {html.escape(target)} · {ts} 기준 ({src})</div>
+      <a class="reanalyze" href="{content_path}?refresh=1">새로고침</a>
+    </div>"""
+
+
+def _page_wrap(body_html):
+    return f"""<!DOCTYPE html><html lang="ko"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>{ANALYZE_CSS}</style></head><body>
+<div class="app">
+{body_html}
+</div>
+{ANALYZE_HELPER_JS}
+</body></html>"""
+
+
+# ---------------- 개요: 기술 SEO 점수·이슈·GEO 상태 (저비용, 캐시 6시간) ----------------
+
+def _compute_overview(target):
+    r = requests.get(target, headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT)
+    tech = audit_technical(r.url, r.text)
+    tech["_security"] = _check_security_headers(r)
     scores = score_categories(tech)
     rx = prescribe(tech=tech)
+    geo_status = check_current_geo_status(target, r.text)
     brand_name = guess_brand_name(tech) or target
     artifacts = generate_all(tech, brand_name=brand_name or None, social_urls=None)
+    return {
+        "tech": tech, "scores": scores, "rx": rx,
+        "geo_status": geo_status, "artifacts": artifacts, "brand_name": brand_name,
+    }
 
-    # 설정에 저장된 브랜드 별칭·사이트 URL을 항상 분석에 반영한다
-    # (이 배포는 조직 1개 전용이라 워크스페이스 구분 없이 전부 적용).
+
+def _render_overview_page(target, data, fetched_at, from_cache):
+    tech, scores, rx = data["tech"], data["scores"], data["rx"]
+    artifacts = data["artifacts"]
+    body = f"""
+    {_render_freshness_bar(target, fetched_at, from_cache, "/_content/overview")}
+    <div class="scores">{_render_seo_score_cards(scores)}</div>
+    <div class="card"><h2>발견된 이슈</h2>{_render_issue_rows(rx)}</div>
+    {_render_tech_detail_card(tech)}
+    {_render_geo_status_card(data["geo_status"])}
+    <div class="card">
+      <div class="card-h"><h2>권장 robots.txt</h2><button class="copy" onclick="cp('r')">복사</button></div>
+      <pre id="r">{_esc_html(artifacts['robots_txt'])}</pre>
+    </div>
+    <div class="card">
+      <div class="card-h"><h2>권장 llms.txt</h2><button class="copy" onclick="cp('l')">복사</button></div>
+      <pre id="l">{_esc_html(artifacts['llms_txt'])}</pre>
+    </div>
+    <div class="card">
+      <div class="card-h"><h2>권장 JSON-LD</h2><button class="copy" onclick="cp('j')">복사</button></div>
+      <pre id="j">{_esc_html(artifacts['json_ld'])}</pre>
+    </div>"""
+    return _page_wrap(body)
+
+
+@app.get("/_content/overview", response_class=HTMLResponse)
+def overview_content(request: Request, refresh: str = ""):
+    target, site_cfg, saved_competitors, saved_prompts, early = _require_site(request)
+    if early:
+        return early
+    try:
+        data, fetched_at, from_cache = _get_cached_or(
+            _cite_domain(target), "overview", TTL_OVERVIEW, bool(refresh),
+            lambda: _compute_overview(target),
+        )
+    except Exception as e:
+        return HTMLResponse(_render_analyze_error_page(target, f"{type(e).__name__}: {e}", "/_content/overview"))
+    return HTMLResponse(_render_overview_page(target, data, fetched_at, from_cache))
+
+
+# ---------------- 웹 성능(PSI) — 느림(최대 2분), 캐시 6시간 ----------------
+
+def _stream_performance(target, force_refresh):
+    yield _page_wrap(f"""
+    {_render_freshness_bar(target, None, False, "/_content/performance")}
+    <div class="scores"><div class="score-card" id="ph-psi"><div class="score-label">웹 성능</div>
+      <div class="score-num" style="font-size:16px;color:var(--dim2)">측정 중…</div></div></div>
+    <div id="ph-psi-detail"></div>""")
+    data, fetched_at, from_cache = _get_cached_or(
+        _cite_domain(target), "psi", TTL_PSI, force_refresh,
+        lambda: collect_pagespeed(target, api_key=config.PAGESPEED_API_KEY or None),
+    )
+    script = (f"fillEl('ph-psi','{_b64(_render_psi_card(data))}');"
+              f"fillEl('ph-psi-detail','{_b64(_render_psi_detail_card(data))}');")
+    yield f"<script>{script}</script>\n</body></html>"
+
+
+@app.get("/_content/performance", response_class=HTMLResponse)
+def performance_content(request: Request, refresh: str = ""):
+    target, site_cfg, saved_competitors, saved_prompts, early = _require_site(request)
+    if early:
+        return early
+    if not refresh:
+        cached, fetched_at, age = cache_store.get_cache(config.SUPABASE_URL, config.SUPABASE_KEY, _cite_domain(target), "psi")
+        if cached is not None and age is not None and age < TTL_PSI:
+            body = (_render_freshness_bar(target, fetched_at, True, "/_content/performance")
+                    + f'<div class="scores">{_render_psi_card(cached)}</div>{_render_psi_detail_card(cached)}')
+            return HTMLResponse(_page_wrap(body))
+    return StreamingResponse(_stream_performance(target, bool(refresh)), media_type="text/html")
+
+
+# ---------------- 사이트 전체 진단 — 느림, 캐시 24시간 ----------------
+
+def _stream_sitecrawl(target, force_refresh):
+    yield _page_wrap(f"""
+    {_render_freshness_bar(target, None, False, "/_content/sitecrawl")}
+    <div class="card" id="ph-sitecrawl"><h2>사이트 전체 진단</h2><div class="issue-empty">크롤링 중…</div></div>""")
+    data, fetched_at, from_cache = _get_cached_or(
+        _cite_domain(target), "sitecrawl", TTL_SITECRAWL, force_refresh,
+        lambda: crawl_site(target, max_pages=SITECRAWL_MAX_PAGES, delay=0.2),
+    )
+    script = f"fillEl('ph-sitecrawl','{_b64(_render_sitecrawl_card(data))}');"
+    yield f"<script>{script}</script>\n</body></html>"
+
+
+@app.get("/_content/sitecrawl", response_class=HTMLResponse)
+def sitecrawl_content(request: Request, refresh: str = ""):
+    target, site_cfg, saved_competitors, saved_prompts, early = _require_site(request)
+    if early:
+        return early
+    if not refresh:
+        cached, fetched_at, age = cache_store.get_cache(config.SUPABASE_URL, config.SUPABASE_KEY, _cite_domain(target), "sitecrawl")
+        if cached is not None and age is not None and age < TTL_SITECRAWL:
+            body = (_render_freshness_bar(target, fetched_at, True, "/_content/sitecrawl")
+                    + _render_sitecrawl_card(cached))
+            return HTMLResponse(_page_wrap(body))
+    return StreamingResponse(_stream_sitecrawl(target, bool(refresh)), media_type="text/html")
+
+
+# ---------------- 경쟁사 기술 SEO 비교 — Gemini 불필요, 캐시 24시간 ----------------
+
+@app.get("/_content/compare", response_class=HTMLResponse)
+def compare_content(request: Request, refresh: str = ""):
+    target, site_cfg, saved_competitors, saved_prompts, early = _require_site(request)
+    if early:
+        return early
+    if not saved_competitors:
+        body = (_render_freshness_bar(target, None, False, "/_content/compare")
+                + '<div class="card"><h2>경쟁사 기술 SEO 비교</h2>'
+                  '<div class="issue-empty">등록된 경쟁사가 없습니다. '
+                  '<a href="/settings/competitors">경쟁사 설정</a>에서 추가해주세요.</div></div>')
+        return HTMLResponse(_page_wrap(body))
+    try:
+        overview_data, _, _ = _get_cached_or(_cite_domain(target), "overview", TTL_OVERVIEW, False,
+                                              lambda: _compute_overview(target))
+    except Exception as e:
+        return HTMLResponse(_render_analyze_error_page(target, f"{type(e).__name__}: {e}", "/_content/compare"))
+    scores = overview_data["scores"]
+    brand_label = overview_data["brand_name"]
+    comp_results, fetched_at, from_cache = _get_cached_or(
+        _cite_domain(target), "techcompare", TTL_COMPARE, bool(refresh),
+        lambda: _run_competitor_tech_audit(saved_competitors),
+    )
+    body = (_render_freshness_bar(target, fetched_at, from_cache, "/_content/compare")
+            + _render_techcompare_card(scores, brand_label, comp_results))
+    return HTMLResponse(_page_wrap(body))
+
+
+# ---------------- AI 노출 + 인용(Gemini) — 쿼터 있음, 캐시 20시간 ----------------
+
+def _resolve_brand_names(site_cfg, target, tech=None):
+    brand_name = guess_brand_name(tech) if tech else None
+    if not brand_name:
+        brand_name = site_cfg["brand_aliases"][0] if site_cfg["brand_aliases"] else _cite_domain(target)
     brand_names = [brand_name] + [a for a in site_cfg["brand_aliases"] if a != brand_name]
     brand_domains = [target] + [u for u in site_cfg["site_urls"] if u != target]
+    return brand_names, brand_domains
 
+
+def _compute_ai_exposure(target, site_cfg, saved_competitors, saved_prompts):
+    """저장된 프롬프트가 있으면 크롤링 없이 곧장 Gemini만 호출한다(브랜드명은 설정에 등록된
+    별칭으로 충분) — 없을 때만 프롬프트 자동 생성을 위해 대상 페이지를 한 번 크롤링한다."""
+    if saved_prompts:
+        gen_prompts = [p["prompt"] for p in saved_prompts]
+        gen_prompts_error = None
+        prompts_source = "saved"
+        prompt_topics = {p["prompt"]: p.get("topic") for p in saved_prompts}
+        brand_names, brand_domains = _resolve_brand_names(site_cfg, target)
+    else:
+        gen_prompts, gen_prompts_error = None, None
+        prompt_topics = {}
+        prompts_source = "generated"
+        try:
+            r = requests.get(target, headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT)
+            tech = audit_technical(r.url, r.text)
+            brand_names, brand_domains = _resolve_brand_names(site_cfg, target, tech=tech)
+            gen_prompts = generate_prompts(tech, config.GEMINI_API_KEY, config.GEMINI_MODEL, count=3)
+        except Exception as e:
+            brand_names, brand_domains = _resolve_brand_names(site_cfg, target)
+            gen_prompts_error = e
+    geo_html, citation_html = _render_geo_and_citation(
+        gen_prompts, gen_prompts_error, brand_names, brand_domains, target,
+        saved_competitors, prompts_source=prompts_source, prompt_topics=prompt_topics,
+    )
+    return {"geo_html": geo_html, "citation_html": citation_html}
+
+
+def _stream_ai_exposure(target, site_cfg, saved_competitors, saved_prompts, force_refresh):
+    yield _page_wrap(f"""
+    {_render_freshness_bar(target, None, False, "/_content/ai-exposure")}
+    <div class="card" id="ph-geo"><h2>AI 노출 (Gemini)</h2><div class="issue-empty">확인 중…</div></div>
+    <div id="ph-citation"></div>""")
+    data, fetched_at, from_cache = _get_cached_or(
+        _cite_domain(target), "ai_exposure", TTL_AI_EXPOSURE, force_refresh,
+        lambda: _compute_ai_exposure(target, site_cfg, saved_competitors, saved_prompts),
+    )
+    script = f"fillEl('ph-geo','{_b64(data['geo_html'])}');"
+    if data.get("citation_html"):
+        script += f"fillEl('ph-citation','{_b64(data['citation_html'])}');"
+    yield f"<script>{script}</script>\n</body></html>"
+
+
+@app.get("/_content/ai-exposure", response_class=HTMLResponse)
+def ai_exposure_content(request: Request, refresh: str = ""):
+    target, site_cfg, saved_competitors, saved_prompts, early = _require_site(request)
+    if early:
+        return early
+    if not config.GEMINI_API_KEY:
+        body = (_render_freshness_bar(target, None, False, "/_content/ai-exposure")
+                + '<div class="card"><h2>AI 노출 (Gemini)</h2><div class="issue-empty">'
+                  'GEMINI_API_KEY가 설정되지 않아 확인하지 못했습니다. '
+                  'aistudio.google.com/apikey 에서 무료로 발급할 수 있습니다.</div></div>')
+        return HTMLResponse(_page_wrap(body))
+    if not refresh:
+        cached, fetched_at, age = cache_store.get_cache(config.SUPABASE_URL, config.SUPABASE_KEY, _cite_domain(target), "ai_exposure")
+        if cached is not None and age is not None and age < TTL_AI_EXPOSURE:
+            body = (_render_freshness_bar(target, fetched_at, True, "/_content/ai-exposure")
+                    + cached["geo_html"] + cached.get("citation_html", ""))
+            return HTMLResponse(_page_wrap(body))
     return StreamingResponse(
-        _stream_analyze(target, r.text, tech, scores, rx, brand_names, brand_domains, artifacts,
-                         saved_competitors, saved_prompts),
+        _stream_ai_exposure(target, site_cfg, saved_competitors, saved_prompts, bool(refresh)),
         media_type="text/html",
     )
 
 
-# ---------------- 분석 결과 조각 렌더링 헬퍼 (스트리밍에서 단계별로 호출됨) ----------------
+# ---------------- 추이 — Supabase 이력만 읽음, 캐시 불필요(항상 즉시) ----------------
+
+@app.get("/_content/trends", response_class=HTMLResponse)
+def trends_content(request: Request):
+    target, site_cfg, saved_competitors, saved_prompts, early = _require_site(request)
+    if early:
+        return early
+    history = get_history(config.SUPABASE_URL, config.SUPABASE_KEY, _cite_domain(target))
+    trend_html = _render_trend_section(history)
+    if not trend_html:
+        trend_html = ('<div class="card"><h2>추이</h2><div class="issue-empty">'
+                       '이력이 2일 미만이라 그래프를 그릴 수 없습니다. AI 노출 확인이 쌓이면 자동으로 채워집니다.'
+                       '</div></div>')
+    body = f'<div class="topbar"><div class="url-label">분석 대상: {html.escape(target)}</div></div>' + trend_html
+    return HTMLResponse(_page_wrap(body))
+
+
+# ---------------- 예약 갱신 (외부 스케줄러가 하루 1회 호출) ----------------
+
+@app.post("/internal/refresh")
+def internal_refresh(token: str = ""):
+    if not config.REFRESH_TOKEN or token != config.REFRESH_TOKEN:
+        return PlainTextResponse("forbidden", status_code=403)
+    if not settings_store.configured(config.SUPABASE_URL, config.SUPABASE_KEY):
+        return PlainTextResponse("supabase not configured", status_code=400)
+    site_cfg = settings_store.get_site_config(config.SUPABASE_URL, config.SUPABASE_KEY)
+    if not site_cfg["site_urls"]:
+        return PlainTextResponse("no site registered", status_code=400)
+    target = site_cfg["site_urls"][0]
+    domain = _cite_domain(target)
+    saved_competitors = settings_store.list_competitors(config.SUPABASE_URL, config.SUPABASE_KEY)
+    saved_prompts = settings_store.list_prompts(config.SUPABASE_URL, config.SUPABASE_KEY, include_archived=False)
+
+    results = {}
+    for kind, fn in (
+        ("overview", lambda: _compute_overview(target)),
+        ("psi", lambda: collect_pagespeed(target, api_key=config.PAGESPEED_API_KEY or None)),
+        ("sitecrawl", lambda: crawl_site(target, max_pages=SITECRAWL_MAX_PAGES, delay=0.2)),
+    ):
+        try:
+            data = fn()
+            cache_store.save_cache(config.SUPABASE_URL, config.SUPABASE_KEY, domain, kind, data)
+            results[kind] = "ok"
+        except Exception as e:
+            results[kind] = f"error: {e}"
+
+    if saved_competitors:
+        try:
+            comp_results = _run_competitor_tech_audit(saved_competitors)
+            cache_store.save_cache(config.SUPABASE_URL, config.SUPABASE_KEY, domain, "techcompare", comp_results)
+            results["techcompare"] = "ok"
+        except Exception as e:
+            results["techcompare"] = f"error: {e}"
+
+    if config.GEMINI_API_KEY:
+        try:
+            data = _compute_ai_exposure(target, site_cfg, saved_competitors, saved_prompts)
+            cache_store.save_cache(config.SUPABASE_URL, config.SUPABASE_KEY, domain, "ai_exposure", data)
+            results["ai_exposure"] = "ok"
+        except Exception as e:
+            results["ai_exposure"] = f"error: {e}"
+
+    return results
+
+
+# ---------------- 분석 결과 조각 렌더링 헬퍼 ----------------
 
 def _render_seo_score_cards(scores):
     out = ""
@@ -568,7 +911,7 @@ def _render_trend_section(history):
     </div>"""
 
 
-def _render_geo_and_citation(gen_prompts, gen_prompts_error, tech, brand_names, brand_domains, target,
+def _render_geo_and_citation(gen_prompts, gen_prompts_error, brand_names, brand_domains, target,
                               extra_competitors, prompts_source="generated", prompt_topics=None):
     """AI 노출(Gemini) + 인용 상세 카드를 만든다. 실패하면 가짜 점수 대신 명확한 에러만 표시.
     brand_names/brand_domains: 등록된 브랜드 별칭·사이트 URL을 전부 포함한 리스트 (guess한 이름/분석 대상
@@ -847,173 +1190,6 @@ def _b64(s):
     return base64.b64encode(s.encode("utf-8")).decode("ascii")
 
 
-def _stream_analyze(target, page_html, tech, scores, rx, brand_names, brand_domains, artifacts,
-                     saved_competitors, saved_prompts):
-    """
-    독립적인 외부 호출(PSI·현재 GEO 상태·Gemini)이 끝나는 대로 해당 카드를 채워 넣고
-    진행률을 갱신하는 스트리밍 응답. 브라우저가 청크를 받는 대로 그 안의 <script>를
-    실행하기 때문에, 클라이언트 쪽엔 폴링/웹소켓 없이 그냥 평범한 HTML 응답이다.
-    (호스팅의 리버스 프록시가 응답을 전부 버퍼링하면 실시간 효과는 없어지지만, 최종
-    결과는 동일하게 나온다.)
-
-    saved_prompts가 있으면 Gemini에 새로 질문을 생성시키지 않고 그대로 쓴다 — 매번 다른
-    질문이면 추이 비교가 의미 없어지기 때문. saved_competitors는 크롤링 없이 Gemini
-    노출·인용 판별 비교 대상에만 포함시킨다.
-    """
-    gemini_enabled = bool(config.GEMINI_API_KEY)
-    using_saved_prompts = gemini_enabled and bool(saved_prompts)
-    has_competitors = bool(saved_competitors)
-    steps_total = 3  # geostatus, psi, sitecrawl
-    if has_competitors:
-        steps_total += 1  # techcompare — Gemini와 무관하게 항상 돌기 때문에 gemini_enabled와 별개
-    if gemini_enabled:
-        steps_total += 1 if using_saved_prompts else 2
-
-    seo_cards = _render_seo_score_cards(scores)
-    issue_rows = _render_issue_rows(rx)
-    tech_detail_card = _render_tech_detail_card(tech)
-    techcompare_placeholder = ("""
-        <div class="card" id="ph-techcompare"><h2>기술 SEO 비교</h2><div class="issue-empty">확인 중…</div></div>"""
-        if has_competitors else "")
-
-    if gemini_enabled:
-        gemini_placeholder = '<div class="card" id="ph-geo"><h2>AI 노출 (Gemini)</h2><div class="issue-empty">확인 중…</div></div>'
-    else:
-        gemini_placeholder = """
-        <div class="card" id="ph-geo">
-          <h2>AI 노출 (Gemini)</h2>
-          <div class="issue-empty">GEMINI_API_KEY가 설정되지 않아 확인하지 못했습니다. aistudio.google.com/apikey 에서 무료로 발급할 수 있습니다.</div>
-        </div>"""
-
-    shell = f"""<!DOCTYPE html><html lang="ko"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<style>{ANALYZE_CSS}</style></head><body>
-<div class="app">
-  <div class="topbar">
-    <div class="url-label">분석 대상: {html.escape(target)}</div>
-    <a class="reanalyze" href="/_content/analyze">다시 분석하기</a>
-  </div>
-  <div class="progress-wrap">
-    <div class="progress-track"><div class="progress-fill" id="pf" style="width:0%"></div></div>
-    <div class="progress-label"><span id="pp">0%</span> · 분석 진행 중</div>
-  </div>
-  <div class="scores">{seo_cards}<div class="score-card" id="ph-psi"><div class="score-label">웹 성능</div><div class="score-num" style="font-size:16px;color:var(--dim2)">측정 중…</div></div></div>
-  <div id="ph-psi-detail"></div>
-  <div class="card"><h2>발견된 이슈</h2>{issue_rows}</div>
-  {tech_detail_card}
-  <div class="card" id="ph-sitecrawl"><h2>사이트 전체 진단</h2><div class="issue-empty">크롤링 중…</div></div>
-  {techcompare_placeholder}
-  <div class="card" id="ph-geostatus"><h2>현재 GEO 상태 (실제 확인)</h2><div class="issue-empty">확인 중…</div></div>
-  {gemini_placeholder}
-  <div id="ph-citation"></div>
-  <div class="card">
-    <div class="card-h"><h2>권장 robots.txt</h2><button class="copy" onclick="cp('r')">복사</button></div>
-    <pre id="r">{_esc_html(artifacts['robots_txt'])}</pre>
-  </div>
-  <div class="card">
-    <div class="card-h"><h2>권장 llms.txt</h2><button class="copy" onclick="cp('l')">복사</button></div>
-    <pre id="l">{_esc_html(artifacts['llms_txt'])}</pre>
-  </div>
-  <div class="card">
-    <div class="card-h"><h2>권장 JSON-LD</h2><button class="copy" onclick="cp('j')">복사</button></div>
-    <pre id="j">{_esc_html(artifacts['json_ld'])}</pre>
-  </div>
-</div>
-{ANALYZE_HELPER_JS}
-"""
-    yield shell
-
-    if steps_total == 0:
-        yield "</body></html>"
-        return
-
-    done = 0
-
-    def progress_script():
-        return f"<script>setProgress({done},{steps_total});</script>\n"
-
-    with ThreadPoolExecutor(max_workers=5) as ex:
-        futures = {}
-        futures[ex.submit(check_current_geo_status, target, page_html)] = "geostatus"
-        futures[ex.submit(collect_pagespeed, target, api_key=config.PAGESPEED_API_KEY or None)] = "psi"
-        futures[ex.submit(crawl_site, target, max_pages=SITECRAWL_MAX_PAGES, delay=0.2)] = "sitecrawl"
-        if has_competitors:
-            futures[ex.submit(_run_competitor_tech_audit, saved_competitors)] = "techcompare"
-        if gemini_enabled and not using_saved_prompts:
-            futures[ex.submit(generate_prompts, tech, config.GEMINI_API_KEY, config.GEMINI_MODEL, count=3)] = "prompts"
-
-        if using_saved_prompts:
-            gen_state = {"value": [p["prompt"] for p in saved_prompts], "error": None}
-        else:
-            gen_state = {"value": None, "error": None}
-        gemini_emitted = False
-
-        def build_gemini_chunk():
-            nonlocal done
-            prompt_topics = ({p["prompt"]: p.get("topic") for p in saved_prompts}
-                              if using_saved_prompts else {})
-            geo_html, cite_html = _render_geo_and_citation(
-                gen_state["value"], gen_state["error"], tech, brand_names, brand_domains, target,
-                saved_competitors, prompts_source="saved" if using_saved_prompts else "generated",
-                prompt_topics=prompt_topics,
-            )
-            done += 1
-            script = f"fillEl('ph-geo','{_b64(geo_html)}');"
-            if cite_html:
-                script += f"fillEl('ph-citation','{_b64(cite_html)}');"
-            return f"<script>{script}</script>\n"
-
-        for fut in as_completed(futures):
-            kind = futures[fut]
-
-            if kind == "geostatus":
-                geo_status = fut.result()
-                frag = _render_geo_status_card(geo_status)
-                done += 1
-                yield f"<script>fillEl('ph-geostatus','{_b64(frag)}');</script>\n"
-                yield progress_script()
-
-            elif kind == "psi":
-                psi = fut.result()
-                frag = _render_psi_card(psi)
-                detail_frag = _render_psi_detail_card(psi)
-                done += 1
-                yield f"<script>fillEl('ph-psi','{_b64(frag)}');fillEl('ph-psi-detail','{_b64(detail_frag)}');</script>\n"
-                yield progress_script()
-
-            elif kind == "sitecrawl":
-                crawl = fut.result()
-                frag = _render_sitecrawl_card(crawl)
-                done += 1
-                yield f"<script>fillEl('ph-sitecrawl','{_b64(frag)}');</script>\n"
-                yield progress_script()
-
-            elif kind == "techcompare":
-                comp_results = fut.result()
-                frag = _render_techcompare_card(scores, brand_names[0], comp_results)
-                done += 1
-                yield f"<script>fillEl('ph-techcompare','{_b64(frag)}');</script>\n"
-                yield progress_script()
-
-            elif kind == "prompts":
-                try:
-                    gen_state["value"] = fut.result()
-                except Exception as e:
-                    gen_state["error"] = e
-                done += 1
-                gemini_emitted = True
-                yield build_gemini_chunk()
-                yield progress_script()
-
-        # using_saved_prompts일 땐 Gemini를 기다리게 할 future가 따로 없으므로,
-        # geostatus/psi(와 필요시 prompts)가 다 끝난 뒤 여기서 발행한다.
-        if gemini_enabled and not gemini_emitted:
-            yield build_gemini_chunk()
-            yield progress_script()
-
-    yield "</body></html>"
-
-
 def _esc_html(s):
     return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
 
@@ -1032,31 +1208,7 @@ def _render_no_site_page():
 </body></html>"""
 
 
-def _render_analyze_ready_page(target, site_cfg, saved_competitors, saved_prompts):
-    extra_sites = len(site_cfg["site_urls"]) - 1
-    site_note = f" 외 {extra_sites}개 등록됨(자사 인용 판별에는 전부 반영)" if extra_sites > 0 else ""
-    prompts_note = (f"저장된 프롬프트 {len(saved_prompts)}개 사용"
-                     if saved_prompts else "저장된 프롬프트 없음 — 실행할 때마다 자동 생성됩니다")
-    return f"""<!DOCTYPE html><html lang="ko"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<style>{SETTINGS_CSS}</style></head><body>
-<div class="app">
-  <div class="card">
-    <h2>분석 실행</h2>
-    <div class="desc">등록된 사이트·경쟁사·프롬프트 설정을 기준으로 기술 진단과 AI 노출을 확인합니다.</div>
-    <div class="list-row" style="border-top:none">
-      <div class="list-main">
-        <div class="list-title">대상 사이트: {html.escape(target)}{site_note}</div>
-        <div class="list-sub">등록된 경쟁사 {len(saved_competitors)}개 · {prompts_note}</div>
-      </div>
-    </div>
-    <a href="/_content/analyze?run=1" class="primary">지금 분석 실행</a>
-  </div>
-</div>
-</body></html>"""
-
-
-def _render_analyze_error_page(target, detail):
+def _render_analyze_error_page(target, detail, retry_path):
     return f"""<!DOCTYPE html><html lang="ko"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>{SETTINGS_CSS}</style></head><body>
@@ -1064,7 +1216,7 @@ def _render_analyze_error_page(target, detail):
   <div class="card">
     <h2>크롤 실패</h2>
     <div class="desc">{html.escape(target)}에서 응답을 받지 못했습니다: {html.escape(detail)}</div>
-    <a href="/_content/analyze?run=1" class="primary">다시 시도</a>
+    <a href="{retry_path}?refresh=1" class="primary">다시 시도</a>
     <a href="/settings/site" class="ghost" style="margin-left:8px">내 사이트 설정 확인</a>
   </div>
 </div>
@@ -1174,7 +1326,7 @@ function cp(id){
 # ---------------- 설정: 내 사이트 / 경쟁사 / 프롬프트 목록 ----------------
 # 매번 URL 분석할 때마다 경쟁사를 타이핑하고 Gemini 질문을 새로 생성하면, 오늘과
 # 내일의 측정 기준이 달라져 추이 비교가 무의미해진다. 여기서 저장해두면
-# analyze_content()가 항상 이 값을 가져다 쓴다.
+# 분석 페이지들이 항상 이 값을 가져다 쓴다.
 
 def _split_lines(s):
     """줄바꿈·쉼표 어느 쪽으로 구분해도 되는 textarea/input 값을 리스트로. 중복 제거."""
