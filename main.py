@@ -256,8 +256,10 @@ def _render_dashboard_summary(domain):
     cards = []
 
     psi, _, _ = cache_store.get_cache(config.SUPABASE_URL, config.SUPABASE_KEY, domain, "psi")
-    if psi and psi.get("source") == "LIVE" and psi.get("performance") is not None:
+    if psi and psi.get("performance") is not None:
         cards.append(("웹 성능", f"{psi['performance']}<span>/100</span>", score_tier(psi["performance"]), "/performance"))
+    elif psi and (psi.get("field_data") or {}).get("lcp_ms") is not None:
+        cards.append(("웹 성능(실사용자)", f"{psi['field_data']['lcp_ms']}<span>ms LCP</span>", "정밀 감사 실패", "/performance"))
     else:
         cards.append(("웹 성능", "—", "확인 필요", "/performance"))
 
@@ -365,19 +367,58 @@ def overview_content(request: Request, refresh: str = ""):
 
 # ---------------- 웹 성능(PSI) — 느림(최대 2분), 캐시 6시간 ----------------
 
+TTL_PSI_PARTIAL = 2 * 3600   # 랩 감사는 실패했지만 CrUX 실측치는 확보한 경우
+TTL_PSI_FAILURE = 15 * 60    # 완전 실패 — 오래 묵히지 말고 금방 다시 시도되게
+
+
+def _psi_freshness_ttl(data):
+    if not data:
+        return 0
+    if data.get("performance") is not None:
+        return TTL_PSI
+    if data.get("field_data"):
+        return TTL_PSI_PARTIAL
+    return TTL_PSI_FAILURE
+
+
+def _get_psi_or_fallback(target, domain, force_refresh):
+    """PSI 전용 캐시 로직. 완전 실패했는데 예전에 성공한(또는 CrUX라도 확보한) 값이
+    있으면, 그 이전 값을 계속 보여주고 캐시는 건드리지 않는다 — 다음 방문 때 그 값의
+    실제 나이를 기준으로 다시 시도된다. "가끔 있는 타임아웃 한 번" 때문에 사용자에게
+    '측정 실패'만 보이는 상황을 피하는 게 목적이다."""
+    old_data, old_fetched_at, age = cache_store.get_cache(config.SUPABASE_URL, config.SUPABASE_KEY, domain, "psi")
+    ttl = _psi_freshness_ttl(old_data)
+    if not force_refresh and old_data is not None and age is not None and age < ttl:
+        return old_data, old_fetched_at, True, None
+
+    new_data = collect_pagespeed(target, api_key=config.PAGESPEED_API_KEY or None)
+    now = datetime.now(timezone.utc)
+    new_is_total_failure = new_data.get("performance") is None and not new_data.get("field_data")
+    old_has_something = old_data and (old_data.get("performance") is not None or old_data.get("field_data"))
+
+    if new_is_total_failure and old_has_something:
+        fallback = dict(old_data)
+        fallback["_stale_note"] = (
+            f"방금 새로 측정을 시도했지만 실패했습니다 — 이전 측정값을 표시합니다. "
+            f"({new_data.get('detail') or '알 수 없는 오류'})")
+        return fallback, old_fetched_at, True, None
+
+    cache_store.save_cache(config.SUPABASE_URL, config.SUPABASE_KEY, domain, "psi", new_data)
+    previous = (old_data if old_data and old_data.get("performance") is not None
+                and new_data.get("performance") is not None else None)
+    return new_data, now, False, previous
+
+
 def _stream_performance(target, force_refresh):
     yield _page_wrap(f"""
     {_render_freshness_bar(target, None, False, "/_content/performance")}
     <div id="ph-change"></div>
     <div class="scores"><div class="score-card" id="ph-psi"><div class="score-label">웹 성능</div>
-      <div class="score-num" style="font-size:16px;color:var(--dim2)">측정 중…</div></div></div>
+      <div class="score-num" style="font-size:16px;color:var(--dim2)">측정 중… (최대 2분 정도 걸릴 수 있습니다)</div></div></div>
     <div id="ph-psi-detail"></div>""")
-    data, fetched_at, from_cache, previous = _get_cached_or(
-        _cite_domain(target), "psi", TTL_PSI, force_refresh,
-        lambda: collect_pagespeed(target, api_key=config.PAGESPEED_API_KEY or None),
-    )
+    data, fetched_at, from_cache, previous = _get_psi_or_fallback(target, _cite_domain(target), force_refresh)
     change_banner = ""
-    if previous and data.get("source") == "LIVE" and previous.get("source") == "LIVE":
+    if previous and data.get("source") in ("LIVE", "LIVE_LITE") and previous.get("source") in ("LIVE", "LIVE_LITE"):
         change_banner = _render_change_banner([
             _diff_line("성능 점수", previous.get("performance"), data.get("performance"), "점"),
         ])
@@ -393,8 +434,9 @@ def performance_content(request: Request, refresh: str = ""):
     if early:
         return early
     if not refresh:
-        cached, fetched_at, age = cache_store.get_cache(config.SUPABASE_URL, config.SUPABASE_KEY, _cite_domain(target), "psi")
-        if cached is not None and age is not None and age < TTL_PSI:
+        domain = _cite_domain(target)
+        cached, fetched_at, age = cache_store.get_cache(config.SUPABASE_URL, config.SUPABASE_KEY, domain, "psi")
+        if cached is not None and age is not None and age < _psi_freshness_ttl(cached):
             body = (_render_freshness_bar(target, fetched_at, True, "/_content/performance")
                     + f'<div class="scores">{_render_psi_card(cached)}</div>{_render_psi_detail_card(cached)}')
             return HTMLResponse(_page_wrap(body))
@@ -619,7 +661,6 @@ def internal_refresh(token: str = ""):
     results = {}
     for kind, fn in (
         ("overview", lambda: _compute_overview(target)),
-        ("psi", lambda: collect_pagespeed(target, api_key=config.PAGESPEED_API_KEY or None)),
         ("sitecrawl", lambda: crawl_site(target, max_pages=SITECRAWL_MAX_PAGES, delay=0.2)),
     ):
         try:
@@ -628,6 +669,14 @@ def internal_refresh(token: str = ""):
             results[kind] = "ok"
         except Exception as e:
             results[kind] = f"error: {e}"
+
+    # PSI는 전용 폴백 로직을 거친다 — 예약 갱신 타이밍에 하필 타임아웃이 나서
+    # 멀쩡했던 캐시를 실패로 덮어써버리는 걸 막기 위해.
+    try:
+        psi_data, _, _, _ = _get_psi_or_fallback(target, domain, force_refresh=True)
+        results["psi"] = "ok" if psi_data.get("performance") is not None or psi_data.get("field_data") else "error: no data"
+    except Exception as e:
+        results["psi"] = f"error: {e}"
 
     if saved_competitors:
         try:
@@ -663,29 +712,49 @@ def _render_seo_score_cards(scores):
 
 
 def _render_psi_card(psi):
+    stale_note = (f'<div class="score-detail" style="color:#c5221f;margin-top:4px">{html.escape(psi["_stale_note"])}</div>'
+                  if psi.get("_stale_note") else "")
+
+    if psi["source"] == "LAB_FAILED" and psi.get("field_data"):
+        fd = psi["field_data"]
+        lcp = f'{fd["lcp_ms"]}ms' if fd.get("lcp_ms") is not None else "—"
+        return f"""
+        <div class="score-card" id="ph-psi">
+          <div class="score-label">웹 성능 (실사용자 데이터)</div>
+          <div class="score-num" style="font-size:20px">LCP {lcp}</div>
+          <div class="score-detail">정밀 감사(라이트하우스)는 실패해 실제 방문자 체감 속도만 표시합니다.</div>
+          {stale_note}
+        </div>"""
+
     if psi["source"].startswith("ERROR"):
         return f"""
         <div class="score-card" id="ph-psi">
           <div class="score-label">웹 성능</div>
           <div class="score-num">측정 실패</div>
           <div class="score-detail">{html.escape(psi.get('detail') or '알 수 없는 오류')}</div>
+          {stale_note}
         </div>"""
-    if psi["source"] == "LIVE" and psi["performance"] is None:
-        return """
+    if psi["performance"] is None:
+        return f"""
         <div class="score-card" id="ph-psi">
           <div class="score-label">웹 성능</div>
           <div class="score-num">측정 불가</div>
           <div class="score-detail">응답은 왔지만 성능 점수가 비어 있습니다.</div>
+          {stale_note}
         </div>"""
     lcp = psi["lcp"] if psi["lcp"] is not None else "—"
     cls = psi["cls"] if psi["cls"] is not None else "—"
     tbt = psi["tbt"] if psi["tbt"] is not None else "—"
+    lite_note = ('<div class="score-detail" style="margin-top:2px">접근성·SEO·권장사항은 이번엔 측정하지 못했습니다.</div>'
+                 if psi["source"] == "LIVE_LITE" else "")
     return f"""
     <div class="score-card" id="ph-psi">
       <div class="score-label">웹 성능</div>
       <div class="score-num">{psi['performance']}<span>/100</span></div>
       <div class="score-tier">{score_tier(psi['performance'])}</div>
       <div class="score-detail">LCP {lcp} · CLS {cls} · TBT {tbt}</div>
+      {lite_note}
+      {stale_note}
     </div>"""
 
 
@@ -694,10 +763,8 @@ _CRUX_TIER_KO = {"FAST": "좋음", "AVERAGE": "보통", "SLOW": "나쁨"}
 
 def _render_psi_detail_card(psi):
     """Lighthouse의 접근성/권장사항/SEO 점수 + 실제 크롬 사용자 체감 속도(CrUX) +
-    개선 여지가 큰 항목(opportunities) — 같은 PSI 호출에 이미 들어있는데 안 쓰던 것들."""
-    if psi["source"].startswith("ERROR") or psi.get("performance") is None:
-        return '<div id="ph-psi-detail"></div>'
-
+    개선 여지가 큰 항목(opportunities) — 같은 PSI 호출에 이미 들어있는데 안 쓰던 것들.
+    performance가 없어도(LAB_FAILED) field_data(CrUX)만으로 카드가 뜰 수 있다."""
     other_scores = ""
     for key, label in (("accessibility", "접근성"), ("best_practices", "권장사항"), ("seo", "SEO")):
         v = psi.get(key)
