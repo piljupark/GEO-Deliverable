@@ -7,11 +7,15 @@ Google PageSpeed Insights API 연동.
 "PageSpeed Insights API" 사용 설정 → API 키 만들기 (기존 프로젝트 재사용 가능)
 
 풀 라이트하우스 감사는 구글 서버가 실제로 헤드리스 크롬을 띄워서 도는 거라
-10초~2분 넘게 걸리기도 하고, 그 변동성은 우리가 통제할 수 없다. "최대한 디테일 +
-항상 성공"을 둘 다 만족시키려고 3단계로 낮춰가며 시도한다:
-  1) 4개 카테고리(성능/SEO/접근성/권장사항) 풀 감사 — 디테일 최대, 제일 느림
-  2) 실패하면 performance 카테고리만 — 훨씬 가볍고 빠름, 핵심 점수는 확보
-  3) 그것도 실패하면 CrUX 전용 API(실제 크롬 사용자 데이터, 라이트하우스 감사
+10초~2분 넘게 걸리기도 하고, 그 변동성은 우리가 통제할 수 없다. 게다가 NO_FCP
+같은 에러는 타임아웃이 아니라 "이 페이지는 렌더링 자체가 안 됨"(봇 차단/WAF
+가능성)이라 재시도해도 똑같이 실패한다. "최대한 디테일 + 항상 성공"을 둘 다
+만족시키려고 낮춰가며/전략을 바꿔가며 시도한다:
+  1) 4개 카테고리(성능/SEO/접근성/권장사항) 풀 감사(모바일 기준) — 디테일 최대
+  2) 렌더링 자체가 막힌 에러였다면, 데스크톱 기준으로 한 번 더 풀 감사 시도
+     (모바일 UA만 차단하는 봇 차단 정책도 있어서 전략을 바꾸면 통과하기도 한다)
+  3) 그래도 실패하면 performance 카테고리만(원래 전략 기준) — 훨씬 가볍고 빠름
+  4) 그것도 실패하면 CrUX 전용 API(실제 크롬 사용자 데이터, 라이트하우스 감사
      없이 거의 즉시 응답) — 랩 점수는 없어도 "실제 방문자 체감 속도"는 표시 가능
 캐시/재시도 정책(오래된 성공값을 실패보다 우선 표시)은 main.py 쪽에서 처리한다 —
 여기서는 "이번 한 번의 시도로 뭘 얻을 수 있는지"만 최대한 성실하게 알아낸다.
@@ -55,6 +59,39 @@ def _empty_result(detail):
     }
 
 
+# 구글 라이트하우스가 "요청은 받았지만 감사 자체를 진행할 수 없었다"고 응답할 때 쓰는
+# 사유 코드 — 타임아웃과 달리 재시도해도 원인이 그대로면 계속 같은 에러가 난다.
+# 우리 쪽 원본 JSON을 그대로 보여주는 대신 사람이 알아볼 수 있는 설명으로 바꾼다.
+_LIGHTHOUSE_ERROR_KO = {
+    "NO_FCP": "구글이 이 페이지에서 콘텐츠가 그려지는 걸 전혀 감지하지 못했습니다 — "
+              "봇 차단(WAF)이 구글의 감사 요청을 막고 있거나, 페이지가 정상적으로 로딩되지 않는 문제일 수 있습니다.",
+    "PAGE_HUNG": "페이지 로딩이 멈춰서 응답하지 않았습니다.",
+    "FAILED_DOCUMENT_REQUEST": "페이지 요청 자체가 실패했습니다 — 접속 차단 가능성이 있습니다.",
+    "DNS_FAILURE": "DNS 조회에 실패했습니다 — 도메인 설정을 확인해주세요.",
+    "INSECURE_DOCUMENT_REQUEST": "HTTPS 인증서 문제로 요청이 거부됐습니다.",
+    "CHROME_INTERSTITIAL_ERROR": "크롬이 보안 경고 페이지를 표시해 감사를 진행할 수 없었습니다.",
+    "NOT_HTML": "응답이 HTML 문서가 아닙니다.",
+    "PROTOCOL_TIMEOUT": "페이지 로딩이 시간 내에 끝나지 않았습니다.",
+}
+
+
+def _extract_lighthouse_detail(exc):
+    """4xx 응답 본문에 담긴 구글 라이트하우스의 실제 사유 코드를 찾아 한국어 설명으로
+    바꾼다. 못 찾으면 None — 호출부가 원래 예외 메시지를 그대로 쓴다."""
+    resp = getattr(exc, "response", None)
+    if resp is None:
+        return None
+    try:
+        data = resp.json()
+        for err in (data.get("error") or {}).get("errors", []):
+            if err.get("domain") == "lighthouse" and err.get("reason"):
+                reason = err["reason"]
+                return _LIGHTHOUSE_ERROR_KO.get(reason, f"라이트하우스 감사 실패({reason})")
+    except Exception:
+        pass
+    return None
+
+
 def query_crux(url, api_key):
     """CrUX(실제 크롬 사용자 데이터) 전용 API. 라이트하우스 감사가 아니라 구글이 이미
     집계해둔 실측 데이터를 그냥 읽어오는 거라 보통 1초 안팎으로 끝난다 — PSI 풀 감사가
@@ -93,7 +130,12 @@ def _run_lighthouse(url, api_key, strategy, categories, timeout, attempts):
         resp = request_with_retry("GET", ENDPOINT, params=params, timeout=timeout, attempts=attempts)
         data = resp.json()
     except Exception as e:
-        return _empty_result(e)
+        friendly = _extract_lighthouse_detail(e)
+        result = _empty_result(e)
+        if friendly:
+            result["detail"] = friendly
+            result["lighthouse_blocked"] = True  # 재시도해도 안 바뀔 성격의 실패 — 봇 차단 등
+        return result
 
     lh = data.get("lighthouseResult", {})
     cats = lh.get("categories", {})
@@ -172,10 +214,19 @@ def collect_pagespeed(url, api_key=None, strategy="mobile"):
     반환 source: "LIVE"(풀 감사 성공) / "LIVE_LITE"(성능만 성공, 나머지 카테고리는 이번엔
     못 받음) / "LAB_FAILED"(랩 감사는 실패했지만 CrUX 실측 데이터는 확보) / "ERROR:...".
     """
-    full = _run_lighthouse(url, api_key, strategy, ["performance", "seo", "accessibility", "best-practices"],
-                            timeout=90, attempts=1)
+    full_categories = ["performance", "seo", "accessibility", "best-practices"]
+    full = _run_lighthouse(url, api_key, strategy, full_categories, timeout=90, attempts=1)
     if full["source"] == "LIVE":
         return full
+
+    # NO_FCP 같은 "봇 차단/렌더링 불가" 에러는 같은 전략으로 재시도해도 똑같이 실패한다 —
+    # 카테고리를 줄이는 대신 전략(모바일↔데스크톱)을 한 번 바꿔서 시도해보는 게 더 유효하다.
+    if full.get("lighthouse_blocked") and strategy == "mobile":
+        alt = _run_lighthouse(url, api_key, "desktop", full_categories, timeout=60, attempts=1)
+        if alt["source"] == "LIVE":
+            alt["detail"] = "모바일 기준 감사는 차단/실패해 데스크톱 기준으로 측정했습니다."
+            return alt
+        full = alt
 
     lite = _run_lighthouse(url, api_key, strategy, ["performance"], timeout=35, attempts=2)
     if lite["source"] == "LIVE":

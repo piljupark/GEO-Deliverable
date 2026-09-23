@@ -745,15 +745,15 @@ def _render_psi_card(psi):
     lcp = psi["lcp"] if psi["lcp"] is not None else "—"
     cls = psi["cls"] if psi["cls"] is not None else "—"
     tbt = psi["tbt"] if psi["tbt"] is not None else "—"
-    lite_note = ('<div class="score-detail" style="margin-top:2px">접근성·SEO·권장사항은 이번엔 측정하지 못했습니다.</div>'
-                 if psi["source"] == "LIVE_LITE" else "")
+    fallback_note = (f'<div class="score-detail" style="margin-top:2px">{html.escape(psi["detail"])}</div>'
+                      if psi.get("detail") else "")
     return f"""
     <div class="score-card" id="ph-psi">
       <div class="score-label">웹 성능</div>
       <div class="score-num">{psi['performance']}<span>/100</span></div>
       <div class="score-tier">{score_tier(psi['performance'])}</div>
       <div class="score-detail">LCP {lcp} · CLS {cls} · TBT {tbt}</div>
-      {lite_note}
+      {fallback_note}
       {stale_note}
     </div>"""
 
