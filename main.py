@@ -45,7 +45,7 @@ from collectors.prescribe import prescribe
 from collectors.pagespeed import collect_pagespeed
 from collectors.geo_gemini import generate_prompts, run_geo_visibility, guess_brand_name
 from collectors.geo_status import check_current_geo_status
-from collectors.history_store import save_snapshot, save_prompt_runs, get_history
+from collectors.history_store import save_snapshot, save_prompt_runs, get_history, get_citation_gaps
 from generators.artifacts import generate_all
 from generators.scoring import score_categories, score_tier
 from layout import sidebar_shell
@@ -191,15 +191,39 @@ def _require_site(request: Request):
 
 def _get_cached_or(domain, kind, ttl_seconds, force_refresh, compute_fn):
     """캐시가 TTL 이내면 그대로, 아니면 compute_fn()을 실행해 새로 계산하고 캐시에 저장한다.
-    반환: (data, fetched_at, from_cache)."""
-    if not force_refresh:
-        data, fetched_at, age = cache_store.get_cache(config.SUPABASE_URL, config.SUPABASE_KEY, domain, kind)
-        if data is not None and age is not None and age < ttl_seconds:
-            return data, fetched_at, True
+    반환: (data, fetched_at, from_cache, previous_data). previous_data는 이번에 실제로 새로
+    계산했을 때, 덮어쓰기 전 남아있던 이전 값 — "지난번 확인 대비 뭐가 바뀌었는지" 배너를
+    만드는 데 쓴다. 캐시 히트(재계산 안 함)면 비교할 새 값이 없으므로 항상 None."""
+    old_data, old_fetched_at, age = cache_store.get_cache(config.SUPABASE_URL, config.SUPABASE_KEY, domain, kind)
+    if not force_refresh and old_data is not None and age is not None and age < ttl_seconds:
+        return old_data, old_fetched_at, True, None
     data = compute_fn()
     now = datetime.now(timezone.utc)
     cache_store.save_cache(config.SUPABASE_URL, config.SUPABASE_KEY, domain, kind, data)
-    return data, now, False
+    return data, now, False, old_data
+
+
+def _diff_line(label, old, new, unit="", higher_is_better=True):
+    """old/new가 둘 다 있고 서로 다르면 변화 문구를, 아니면(비교 불가·동일) None을 반환.
+    순위처럼 숫자가 작을수록 좋은 지표는 higher_is_better=False로 화살표 방향을 뒤집는다."""
+    if old is None or new is None or old == new:
+        return None
+    improved = (new > old) if higher_is_better else (new < old)
+    arrow = "▲" if improved else "▼"
+    return f"{label} {old}{unit} → {new}{unit} {arrow}"
+
+
+def _render_change_banner(lines):
+    """방금 재계산했을 때만 의미가 있다(캐시 히트면 비교할 새 값 자체가 없다) —
+    지난 확인 대비 뭐가 바뀌었는지 한눈에 보여줘서, 사용자가 값 하나하나를 직접
+    기억하고 비교할 필요가 없게 한다."""
+    lines = [l for l in lines if l]
+    if not lines:
+        return ""
+    items = "".join(f"<div>{html.escape(l)}</div>" for l in lines)
+    return (f'<div class="card" style="background:#F3F3F1;border-style:dashed">'
+            f'<div class="sub-inline" style="margin-bottom:8px">지난 확인 대비 변화</div>'
+            f'<div style="font-size:13px;line-height:1.8">{items}</div></div>')
 
 
 def _render_freshness_bar(target, fetched_at, from_cache, content_path):
@@ -223,6 +247,54 @@ def _page_wrap(body_html):
 </body></html>"""
 
 
+# ---------------- 종합 현황 — 다른 페이지들의 캐시를 읽기만 함(계산 트리거 안 함) ----------------
+
+def _render_dashboard_summary(domain):
+    """웹 성능/사이트 진단/AI 노출/경쟁사 비교는 각자 페이지에서 계산·캐시된 값을
+    읽기만 한다 — 여기서 새로 계산하면 개요 페이지가 다시 느려지는 의미가 없어진다.
+    한 번도 확인 안 한 항목은 '확인 필요'로 표시하고 해당 페이지로 링크한다."""
+    cards = []
+
+    psi, _, _ = cache_store.get_cache(config.SUPABASE_URL, config.SUPABASE_KEY, domain, "psi")
+    if psi and psi.get("source") == "LIVE" and psi.get("performance") is not None:
+        cards.append(("웹 성능", f"{psi['performance']}<span>/100</span>", score_tier(psi["performance"]), "/performance"))
+    else:
+        cards.append(("웹 성능", "—", "확인 필요", "/performance"))
+
+    crawl, _, _ = cache_store.get_cache(config.SUPABASE_URL, config.SUPABASE_KEY, domain, "sitecrawl")
+    if crawl and crawl.get("pages"):
+        broken = sum(1 for p in crawl["pages"] if p["status_code"] == 0 or p["status_code"] >= 400)
+        cards.append(("사이트 진단", f"{len(crawl['pages'])}<span>페이지</span>", f"오류 {broken}개", "/sitecrawl"))
+    else:
+        cards.append(("사이트 진단", "—", "확인 필요", "/sitecrawl"))
+
+    ai, _, _ = cache_store.get_cache(config.SUPABASE_URL, config.SUPABASE_KEY, domain, "ai_exposure")
+    ai_summary = (ai or {}).get("summary") or {}
+    if ai_summary.get("status") == "ok":
+        rank_str = f"#{ai_summary['self_rank']}" if ai_summary.get("self_rank") else "—"
+        exp = ai_summary.get("exposure_score")
+        cards.append(("AI 노출 순위", rank_str, f"노출도 {exp}점" if exp is not None else "—", "/ai-exposure"))
+    else:
+        cards.append(("AI 노출", "—", "확인 필요", "/ai-exposure"))
+
+    comp, _, _ = cache_store.get_cache(config.SUPABASE_URL, config.SUPABASE_KEY, domain, "techcompare")
+    if comp:
+        ok_comps = [c for c in comp if c.get("scores")]
+        cards.append(("경쟁사 비교", f"{len(ok_comps)}<span>개</span>", "비교 결과 있음", "/compare"))
+    else:
+        cards.append(("경쟁사 비교", "—", "확인 필요", "/compare"))
+
+    cards_html = "".join(f"""
+    <a class="score-card" href="{href}" style="text-decoration:none;color:inherit;display:block">
+      <div class="score-label">{html.escape(label)}</div>
+      <div class="score-num">{num}</div>
+      <div class="score-tier">{html.escape(sub)}</div>
+    </a>""" for label, num, sub, href in cards)
+    return f"""
+    <div class="sub-inline" style="font-size:13px;font-weight:500;color:var(--dim);margin:20px 0 8px">종합 현황</div>
+    <div class="scores">{cards_html}</div>"""
+
+
 # ---------------- 개요: 기술 SEO 점수·이슈·GEO 상태 (저비용, 캐시 6시간) ----------------
 
 def _compute_overview(target):
@@ -240,11 +312,23 @@ def _compute_overview(target):
     }
 
 
-def _render_overview_page(target, data, fetched_at, from_cache):
+def _render_overview_page(target, data, fetched_at, from_cache, previous=None):
     tech, scores, rx = data["tech"], data["scores"], data["rx"]
     artifacts = data["artifacts"]
+    change_lines = []
+    if previous:
+        for key, s in scores.items():
+            old_s = (previous.get("scores") or {}).get(key)
+            if old_s:
+                change_lines.append(_diff_line(s["label"], old_s["score"], s["score"], "점"))
+        change_lines.append(_diff_line(
+            "발견된 이슈 수", len((previous.get("rx") or {}).get("todos", [])), len(rx["todos"]), "개",
+            higher_is_better=False))
     body = f"""
     {_render_freshness_bar(target, fetched_at, from_cache, "/_content/overview")}
+    {_render_change_banner(change_lines)}
+    {_render_dashboard_summary(_cite_domain(target))}
+    <div class="sub-inline" style="font-size:13px;font-weight:500;color:var(--dim);margin:20px 0 8px">기술 SEO 점수</div>
     <div class="scores">{_render_seo_score_cards(scores)}</div>
     <div class="card"><h2>발견된 이슈</h2>{_render_issue_rows(rx)}</div>
     {_render_tech_detail_card(tech)}
@@ -270,13 +354,13 @@ def overview_content(request: Request, refresh: str = ""):
     if early:
         return early
     try:
-        data, fetched_at, from_cache = _get_cached_or(
+        data, fetched_at, from_cache, previous = _get_cached_or(
             _cite_domain(target), "overview", TTL_OVERVIEW, bool(refresh),
             lambda: _compute_overview(target),
         )
     except Exception as e:
         return HTMLResponse(_render_analyze_error_page(target, f"{type(e).__name__}: {e}", "/_content/overview"))
-    return HTMLResponse(_render_overview_page(target, data, fetched_at, from_cache))
+    return HTMLResponse(_render_overview_page(target, data, fetched_at, from_cache, previous))
 
 
 # ---------------- 웹 성능(PSI) — 느림(최대 2분), 캐시 6시간 ----------------
@@ -284,14 +368,21 @@ def overview_content(request: Request, refresh: str = ""):
 def _stream_performance(target, force_refresh):
     yield _page_wrap(f"""
     {_render_freshness_bar(target, None, False, "/_content/performance")}
+    <div id="ph-change"></div>
     <div class="scores"><div class="score-card" id="ph-psi"><div class="score-label">웹 성능</div>
       <div class="score-num" style="font-size:16px;color:var(--dim2)">측정 중…</div></div></div>
     <div id="ph-psi-detail"></div>""")
-    data, fetched_at, from_cache = _get_cached_or(
+    data, fetched_at, from_cache, previous = _get_cached_or(
         _cite_domain(target), "psi", TTL_PSI, force_refresh,
         lambda: collect_pagespeed(target, api_key=config.PAGESPEED_API_KEY or None),
     )
-    script = (f"fillEl('ph-psi','{_b64(_render_psi_card(data))}');"
+    change_banner = ""
+    if previous and data.get("source") == "LIVE" and previous.get("source") == "LIVE":
+        change_banner = _render_change_banner([
+            _diff_line("성능 점수", previous.get("performance"), data.get("performance"), "점"),
+        ])
+    script = (f"fillEl('ph-change','{_b64(change_banner)}');"
+              f"fillEl('ph-psi','{_b64(_render_psi_card(data))}');"
               f"fillEl('ph-psi-detail','{_b64(_render_psi_detail_card(data))}');")
     yield f"<script>{script}</script>\n</body></html>"
 
@@ -316,7 +407,7 @@ def _stream_sitecrawl(target, force_refresh):
     yield _page_wrap(f"""
     {_render_freshness_bar(target, None, False, "/_content/sitecrawl")}
     <div class="card" id="ph-sitecrawl"><h2>사이트 전체 진단</h2><div class="issue-empty">크롤링 중…</div></div>""")
-    data, fetched_at, from_cache = _get_cached_or(
+    data, fetched_at, from_cache, _ = _get_cached_or(
         _cite_domain(target), "sitecrawl", TTL_SITECRAWL, force_refresh,
         lambda: crawl_site(target, max_pages=SITECRAWL_MAX_PAGES, delay=0.2),
     )
@@ -352,13 +443,13 @@ def compare_content(request: Request, refresh: str = ""):
                   '<a href="/settings/competitors">경쟁사 설정</a>에서 추가해주세요.</div></div>')
         return HTMLResponse(_page_wrap(body))
     try:
-        overview_data, _, _ = _get_cached_or(_cite_domain(target), "overview", TTL_OVERVIEW, False,
-                                              lambda: _compute_overview(target))
+        overview_data, _, _, _ = _get_cached_or(_cite_domain(target), "overview", TTL_OVERVIEW, False,
+                                                 lambda: _compute_overview(target))
     except Exception as e:
         return HTMLResponse(_render_analyze_error_page(target, f"{type(e).__name__}: {e}", "/_content/compare"))
     scores = overview_data["scores"]
     brand_label = overview_data["brand_name"]
-    comp_results, fetched_at, from_cache = _get_cached_or(
+    comp_results, fetched_at, from_cache, _ = _get_cached_or(
         _cite_domain(target), "techcompare", TTL_COMPARE, bool(refresh),
         lambda: _run_competitor_tech_audit(saved_competitors),
     )
@@ -399,23 +490,70 @@ def _compute_ai_exposure(target, site_cfg, saved_competitors, saved_prompts):
         except Exception as e:
             brand_names, brand_domains = _resolve_brand_names(site_cfg, target)
             gen_prompts_error = e
-    geo_html, citation_html = _render_geo_and_citation(
+    geo_html, citation_html, summary = _render_geo_and_citation(
         gen_prompts, gen_prompts_error, brand_names, brand_domains, target,
         saved_competitors, prompts_source=prompts_source, prompt_topics=prompt_topics,
     )
-    return {"geo_html": geo_html, "citation_html": citation_html}
+    return {"geo_html": geo_html, "citation_html": citation_html, "summary": summary}
+
+
+def _render_citation_gap_card(gaps):
+    """geo_prompt_runs 이력이 쌓이면서 가능해진 카드 — Gemini를 추가로 호출하지 않고
+    이미 쌓인 이력만 읽어서 "경쟁사만 인용되고 우리는 안 된 질문"을 보여준다."""
+    if not gaps:
+        return ""
+    rows = ""
+    for g in gaps[:5]:
+        comp_str = ", ".join(
+            f"{html.escape(name)}({cnt}회)"
+            for name, cnt in sorted(g["competitors"].items(), key=lambda kv: -kv[1])
+        )
+        topic_str = f" · 주제: {html.escape(g['topic'])}" if g.get("topic") else ""
+        rows += f"""
+        <div class="issue-row">
+          <div>
+            <div class="issue-title">{html.escape(g['prompt'])}</div>
+            <div class="issue-why">최근 {g['total_count']}회 중 {g['gap_count']}회 경쟁사만 인용됨 — {comp_str}{topic_str}</div>
+          </div>
+        </div>"""
+    return f"""
+    <div class="card">
+      <h2>인용 기회</h2>
+      <div class="sub-inline">최근 30일 기록 기준 — 경쟁사는 인용됐는데 우리는 안 된 질문 (많이 나온 순)</div>
+      {rows}
+    </div>"""
+
+
+def _ai_exposure_change_banner(summary, previous):
+    if not previous:
+        return ""
+    prev_summary = previous.get("summary") or {}
+    if summary.get("status") != "ok" or prev_summary.get("status") != "ok":
+        return ""
+    return _render_change_banner([
+        _diff_line("노출도 점수", prev_summary.get("exposure_score"), summary.get("exposure_score"), "점"),
+        _diff_line("노출도 순위", prev_summary.get("self_rank"), summary.get("self_rank"),
+                   higher_is_better=False),
+        _diff_line("인용 점유율", prev_summary.get("citation_share"), summary.get("citation_share"), "%"),
+    ])
 
 
 def _stream_ai_exposure(target, site_cfg, saved_competitors, saved_prompts, force_refresh):
     yield _page_wrap(f"""
     {_render_freshness_bar(target, None, False, "/_content/ai-exposure")}
+    <div id="ph-change"></div>
     <div class="card" id="ph-geo"><h2>AI 노출 (Gemini)</h2><div class="issue-empty">확인 중…</div></div>
-    <div id="ph-citation"></div>""")
-    data, fetched_at, from_cache = _get_cached_or(
+    <div id="ph-citation"></div>
+    <div id="ph-citegap"></div>""")
+    data, fetched_at, from_cache, previous = _get_cached_or(
         _cite_domain(target), "ai_exposure", TTL_AI_EXPOSURE, force_refresh,
         lambda: _compute_ai_exposure(target, site_cfg, saved_competitors, saved_prompts),
     )
-    script = f"fillEl('ph-geo','{_b64(data['geo_html'])}');"
+    change_banner = _ai_exposure_change_banner(data.get("summary") or {}, previous)
+    gaps = get_citation_gaps(config.SUPABASE_URL, config.SUPABASE_KEY, _cite_domain(target))
+    script = (f"fillEl('ph-change','{_b64(change_banner)}');"
+              f"fillEl('ph-geo','{_b64(data['geo_html'])}');"
+              f"fillEl('ph-citegap','{_b64(_render_citation_gap_card(gaps))}');")
     if data.get("citation_html"):
         script += f"fillEl('ph-citation','{_b64(data['citation_html'])}');"
     yield f"<script>{script}</script>\n</body></html>"
@@ -435,8 +573,9 @@ def ai_exposure_content(request: Request, refresh: str = ""):
     if not refresh:
         cached, fetched_at, age = cache_store.get_cache(config.SUPABASE_URL, config.SUPABASE_KEY, _cite_domain(target), "ai_exposure")
         if cached is not None and age is not None and age < TTL_AI_EXPOSURE:
+            gaps = get_citation_gaps(config.SUPABASE_URL, config.SUPABASE_KEY, _cite_domain(target))
             body = (_render_freshness_bar(target, fetched_at, True, "/_content/ai-exposure")
-                    + cached["geo_html"] + cached.get("citation_html", ""))
+                    + cached["geo_html"] + cached.get("citation_html", "") + _render_citation_gap_card(gaps))
             return HTMLResponse(_page_wrap(body))
     return StreamingResponse(
         _stream_ai_exposure(target, site_cfg, saved_competitors, saved_prompts, bool(refresh)),
@@ -918,7 +1057,8 @@ def _render_geo_and_citation(gen_prompts, gen_prompts_error, brand_names, brand_
     URL이 항상 0번째). extra_competitors: 설정에 저장된 경쟁사 목록 — 직접 크롤링하지 않고
     Gemini 노출·인용 판별에만 쓴다. prompt_topics: {프롬프트 텍스트: 주제} — 저장된 프롬프트를
     쓴 경우에만 채워지며, 프롬프트별 원본 이력 적재 시 주제를 같이 남기는 데 쓴다.
-    반환값: (geo_section_html, citation_detail_html)"""
+    반환값: (geo_section_html, citation_detail_html, summary) — summary는 대시보드·변화감지용
+    원시 숫자 dict {status, exposure_score, citation_share, mention_share, self_rank, total}."""
     brand_label = brand_names[0]
     try:
         if gen_prompts_error:
@@ -1132,7 +1272,9 @@ def _render_geo_and_citation(gen_prompts, gen_prompts_error, brand_names, brand_
               <h2>AI 노출 (Gemini)</h2>
               {quota_banner}
             </div>""" + _render_trend_section(history)
-            return geo_section, citation_detail_section
+            summary = {"status": "quota", "exposure_score": None, "citation_share": None,
+                       "mention_share": None, "self_rank": None, "total": total}
+            return geo_section, citation_detail_section, summary
         trend_section = _render_trend_section(history)
 
         prompts_desc = "저장된 프롬프트" if prompts_source == "saved" else "자동 생성된 질문"
@@ -1172,7 +1314,9 @@ def _render_geo_and_citation(gen_prompts, gen_prompts_error, brand_names, brand_
         {trend_section}
         {exposure_bar_html}
         {mention_share_html}"""
-        return geo_section, citation_detail_section
+        summary = {"status": "ok", "exposure_score": exposure_score, "citation_share": citation_share,
+                   "mention_share": mention_share, "self_rank": self_rank, "total": total}
+        return geo_section, citation_detail_section, summary
     except Exception as e:
         if "429" in str(e):
             msg = "Gemini 무료 쿼터를 초과했습니다 — 분당 한도면 1분 후, 일일 한도면 하루 지나야 복구됩니다."
@@ -1183,7 +1327,9 @@ def _render_geo_and_citation(gen_prompts, gen_prompts_error, brand_names, brand_
           <h2>AI 노출 (Gemini)</h2>
           <div class="issue-empty">{msg}</div>
         </div>"""
-        return geo_section, ""
+        summary = {"status": "error", "exposure_score": None, "citation_share": None,
+                   "mention_share": None, "self_rank": None, "total": None}
+        return geo_section, "", summary
 
 
 def _b64(s):

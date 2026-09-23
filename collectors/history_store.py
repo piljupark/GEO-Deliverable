@@ -85,6 +85,53 @@ def save_prompt_runs(supabase_url, supabase_key, domain, records, prompt_topics=
         pass
 
 
+def get_citation_gaps(supabase_url, supabase_key, domain, days=30, limit=200):
+    """최근 days일간의 geo_prompt_runs에서 "경쟁사는 인용됐는데 우리는 안 된" 프롬프트를 찾는다.
+    프롬프트별로 집계해서 gap_count(경쟁사만 인용된 횟수) 많은 순으로 정렬한 리스트를 반환.
+    각 항목: {prompt, topic, gap_count, total_count, competitors: {name: count}, last_date}.
+    설정이 없거나 조회 실패, 데이터가 없으면 빈 리스트 — 카드가 그냥 안 뜬다."""
+    if not (supabase_url and supabase_key):
+        return []
+    try:
+        cutoff = (date.today() - timedelta(days=days)).isoformat()
+        resp = requests.get(
+            f"{supabase_url}/rest/v1/{RUNS_TABLE}",
+            params={
+                "domain": f"eq.{domain}",
+                "date": f"gte.{cutoff}",
+                "status": "eq.LIVE",
+                "select": "prompt,topic,date,cited,competitor_citations",
+                "order": "date.desc",
+                "limit": str(limit),
+            },
+            headers=_headers(supabase_key),
+            timeout=10,
+        )
+        resp.raise_for_status()
+        rows = resp.json()
+    except Exception:
+        return []
+
+    by_prompt = {}
+    for row in rows:
+        entry = by_prompt.setdefault(row["prompt"], {
+            "prompt": row["prompt"], "topic": row.get("topic"),
+            "gap_count": 0, "total_count": 0, "competitors": {}, "last_date": row["date"],
+        })
+        entry["total_count"] += 1
+        entry["last_date"] = max(entry["last_date"], row["date"])
+        cited_competitors = [name for name, v in (row.get("competitor_citations") or {}).items() if v]
+        if row.get("cited") or not cited_competitors:
+            continue  # 우리가 인용됐거나 아무도 인용 안 됐으면 "기회"가 아니다
+        entry["gap_count"] += 1
+        for name in cited_competitors:
+            entry["competitors"][name] = entry["competitors"].get(name, 0) + 1
+
+    gaps = [e for e in by_prompt.values() if e["gap_count"] > 0]
+    gaps.sort(key=lambda e: -e["gap_count"])
+    return gaps
+
+
 def get_history(supabase_url, supabase_key, domain, days=30):
     """최근 days일치 (date, exposure_score, citation_share, mention_share) 목록.
     설정이 없거나 조회 실패하면 빈 리스트 — 추이 카드가 그냥 안 뜬다."""
